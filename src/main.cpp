@@ -113,6 +113,11 @@ void setup() {
                                          subscription_callback, ON_NEW_DATA));
   digitalWrite(LED_5_PIN, HIGH);
   digitalWrite(POWER_LED_PIN, HIGH);
+  digitalWrite(LED_1_PIN, LOW);
+  digitalWrite(LED_2_PIN, LOW);
+  digitalWrite(LED_3_PIN, LOW);
+  digitalWrite(LED_4_PIN, LOW);
+  digitalWrite(LED_5_PIN, LOW);
 }
 
 void loop() {
