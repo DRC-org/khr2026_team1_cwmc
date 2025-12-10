@@ -16,7 +16,7 @@ CAN 通信を行い、各アクチュエータやセンサ等を制御します�
 
 ### セットアップ
 
-### 1. WSL2 のセットアップ
+#### 1. WSL2 のセットアップ
 
 WSL2 上に Ubuntu をインストールします。
 
@@ -31,7 +31,7 @@ sudo apt update
 sudo apt upgrade
 ```
 
-### 2. ROS 2 Kilted Kaiju のインストール
+#### 2. ROS 2 Kilted Kaiju のインストール
 
 以下のコマンドをすべて実行し、ROS 2 Kilted Kaiju をインストールします。
 
@@ -48,7 +48,7 @@ source /opt/ros/kilted/setup.bash
 echo -e "\n# ROS 2\nsource /opt/ros/kilted/setup.bash" >> ~/.bashrc
 ```
 
-### 3. Build Essential のインストール
+#### 3. Build Essential のインストール
 
 ```sh
 sudo apt update
