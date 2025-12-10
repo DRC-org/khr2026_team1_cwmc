@@ -12,7 +12,6 @@ rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
-rcl_timer_t timer;
 
 #define POWER_LED_PIN 2
 #define ERROR_LED_PIN 12
@@ -27,12 +26,6 @@ rcl_timer_t timer;
     rcl_ret_t temp_rc = fn;        \
     if ((temp_rc != RCL_RET_OK)) { \
       error_loop();                \
-    }                              \
-  }
-#define RCSOFTCHECK(fn)            \
-  {                                \
-    rcl_ret_t temp_rc = fn;        \
-    if ((temp_rc != RCL_RET_OK)) { \
     }                              \
   }
 
@@ -54,12 +47,11 @@ void subscription_callback(const void* msgin) {
   }
   int led_pins[5] = {LED_1_PIN, LED_2_PIN, LED_3_PIN, LED_4_PIN, LED_5_PIN};
   digitalWrite(led_pins[led_number - 1], HIGH);
-  delay(1000);
+  delay(100);
   digitalWrite(led_pins[led_number - 1], LOW);
 }
 
 void setup() {
-  // Configure serial transport
   Serial.begin(115200);
   set_microros_serial_transports(Serial);
 
@@ -122,5 +114,5 @@ void setup() {
 
 void loop() {
   delay(100);
-  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
+  RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
 }
