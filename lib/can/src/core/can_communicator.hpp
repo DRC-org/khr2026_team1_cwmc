@@ -29,8 +29,7 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
   void setup(
       twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
   void transmit(const CanTxMessage message) const override;
-  static bool receive(twai_node_handle_t handle,
-                      const twai_rx_done_event_data_t* edata, void* user_ctx);
+  void receive() const override;
   void add_receive_event_listener(
       std::vector<can::CanId> listening_can_ids,
       std::function<void(const can::CanId, const std::array<uint8_t, 8>)>
@@ -39,6 +38,9 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
  private:
   /// @brief CAN通信インスタンス
   twai_node_handle_t node_hdl;
+
+  static bool receive(twai_node_handle_t handle,
+                      const twai_rx_done_event_data_t* edata, void* user_ctx);
 
   /// @brief CAN受信時のイベントリスナのリスト
   std::vector<std::pair<

@@ -26,7 +26,7 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
 
   // receive イベントを登録
   twai_event_callbacks_t user_cbs = {};
-  user_cbs.on_rx_done = this->receive;
+  user_cbs.on_rx_done = &CanCommunicator::receive;
 
   if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) == ESP_OK) {
     Serial.println("Register receive event OK!");
@@ -96,6 +96,11 @@ void CanCommunicator::transmit(const CanTxMessage message) const {
   }
 }
 
+void CanCommunicator::receive() const {
+  // Reception is handled by the TWAI ISR callback.
+  // This method is provided to satisfy the CanReceiver interface.
+}
+
 bool CanCommunicator::receive(twai_node_handle_t handle,
                               const twai_rx_done_event_data_t* edata,
                               void* user_ctx) {
@@ -108,7 +113,9 @@ bool CanCommunicator::receive(twai_node_handle_t handle,
       .buffer_len = sizeof(recv_buff),
   };
 
-  if (twai_node_receive_from_isr(communicator->node_hdl, &rx_frame) != ESP_OK) {
+  const auto rx_result =
+      twai_node_receive_from_isr(communicator->node_hdl, &rx_frame);
+  if (rx_result != ESP_OK) {
     Serial.println("Receive fail: twai_node_receive_from_isr error");
     return false;
   }
