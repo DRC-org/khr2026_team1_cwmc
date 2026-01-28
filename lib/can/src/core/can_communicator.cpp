@@ -14,7 +14,7 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   node_config.io_cfg.tx = CAN_TX;
   node_config.io_cfg.rx = CAN_RX;
   node_config.bit_timing.bitrate = 1000000;  // 1 Mbps
-  node_config.tx_queue_depth = 0;            // 送信キューを無効化
+  node_config.tx_queue_depth = 5;
 
   // TWAI コントローラのインスタンスを作成
   if (twai_new_node_onchip(&node_config, &node_hdl) == ESP_OK) {

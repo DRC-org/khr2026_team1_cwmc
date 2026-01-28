@@ -43,16 +43,29 @@ float current_rpm_rr = 0.0;
 void error_loop() {
   while (1) {
     Serial.println("An error occurred in micro-ROS!");
-    delay(100);
+    delay(5000000);
   }
 }
+
+// rspi と Wi-Fi 経由で接続する場合用
+#if (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
+char ssid[] = "DRC";
+char psk[] = "28228455";
+IPAddress agent_ip(192, 168, 0, 100);
+size_t agent_port = 8888;
+#endif
 
 // micro-ROS のセットアップ
 // @see
 // https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/micro-ros_publisher/src/Main.cpp
 // @see https://github.com/micro-ROS/micro-ROS-demos/tree/jazzy/rclc
 void setup_micro_ros() {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL == 1)
   set_microros_serial_transports(Serial);
+#elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
+  set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
+#endif
+
   allocator = rcl_get_default_allocator();
 
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
@@ -133,6 +146,7 @@ void milli_amperes_to_bytes(const int32_t milli_amperes[4],
 
 // rspi からの JSON を受け取る
 void subscription_callback(const void* msgin) {
+  Serial.println("Received message from rspi");
   const std_msgs__msg__String* msg = (const std_msgs__msg__String*)msgin;
 
   // JSON をパース
