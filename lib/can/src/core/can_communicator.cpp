@@ -14,7 +14,7 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   node_config.io_cfg.tx = CAN_TX;
   node_config.io_cfg.rx = CAN_RX;
   node_config.bit_timing.bitrate = 1000000;  // 1 Mbps
-  node_config.tx_queue_depth = 5;
+  node_config.tx_queue_depth = 1;
 
   // TWAI コントローラのインスタンスを作成
   if (twai_new_node_onchip(&node_config, &node_hdl) == ESP_OK) {
@@ -25,15 +25,16 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   }
 
   // receive イベントを登録
-  twai_event_callbacks_t user_cbs = {};
-  user_cbs.on_rx_done = &CanCommunicator::receive;
+  // twai_event_callbacks_t user_cbs = {};
+  // user_cbs.on_rx_done = &CanCommunicator::receive;
 
-  if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) == ESP_OK) {
-    Serial.println("Register receive event OK!");
-  } else {
-    Serial.println("Register receive event fail!");
-    return;
-  }
+  // if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) ==
+  // ESP_OK) {
+  //   Serial.println("Register receive event OK!");
+  // } else {
+  //   Serial.println("Register receive event fail!");
+  //   return;
+  // }
 
   // TWAI コントローラを有効化
   if (twai_node_enable(node_hdl) == ESP_OK) {

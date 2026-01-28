@@ -5,6 +5,7 @@
 #include <rclc/executor.h>
 #include <rclc/rclc.h>
 #include <std_msgs/msg/string.h>
+#include <stdlib.h>
 
 #include <can/core.hpp>
 #include <can/peripheral.hpp>
@@ -20,15 +21,15 @@ rcl_node_t node;
 can::CanCommunicator* can_comm;
 
 // setup より前に使うので前方宣言しておく
-void subscription_callback(const void* msgin);
+// void subscription_callback(const void* msgin);
 
-float current_rpm_fl = 0.0;
-float current_rpm_fr = 0.0;
-float current_rpm_rl = 0.0;
-float current_rpm_rr = 0.0;
+volatile float current_rpm_fl = 0.0;
+volatile float current_rpm_fr = 0.0;
+volatile float current_rpm_rl = 0.0;
+volatile float current_rpm_rr = 0.0;
 
 // P 制御用
-#define KP 1.0
+#define KP 3.0
 #define CLAMPING_OUTPUT 5000  // 電流値のクランピング値 [mA]
 
 #define RCCHECK(fn)                \
@@ -54,36 +55,6 @@ char psk[] = "28228455";
 IPAddress agent_ip(192, 168, 0, 100);
 size_t agent_port = 8888;
 #endif
-
-// micro-ROS のセットアップ
-// @see
-// https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/micro-ros_publisher/src/Main.cpp
-// @see https://github.com/micro-ROS/micro-ROS-demos/tree/jazzy/rclc
-void setup_micro_ros() {
-#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL == 1)
-  set_microros_serial_transports(Serial);
-#elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
-  set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
-#endif
-
-  allocator = rcl_get_default_allocator();
-
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-  RCCHECK(
-      rclc_node_init_default(&node, "m3508_motor_controller", "", &support));
-
-  // rspi からのサブスクリプションを初期化
-  RCCHECK(rclc_subscription_init_default(
-      &subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-      "robot_control"));
-
-  // エグゼキュータを初期化
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-
-  // サブスクリプションをエグゼキュータに追加
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg,
-                                         subscription_callback, ON_NEW_DATA));
-}
 
 void register_can_event_handlers() {
   // M3508 のフィードバック値を受け取る
@@ -144,10 +115,15 @@ void milli_amperes_to_bytes(const int32_t milli_amperes[4],
   }
 }
 
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
 // rspi からの JSON を受け取る
 void subscription_callback(const void* msgin) {
-  Serial.println("Received message from rspi");
   const std_msgs__msg__String* msg = (const std_msgs__msg__String*)msgin;
+
+  // msg をプレーンテキストで表示（デバッグ用）
+  Serial.print("Received message: ");
+  Serial.println(msg->data.data);
 
   // JSON をパース
   JsonDocument doc;
@@ -159,12 +135,14 @@ void subscription_callback(const void* msgin) {
     return;
   }
 
-  int16_t fl_rpm = doc["m3508_rpms"]["fl"] | 0;
-  int16_t fr_rpm = doc["m3508_rpms"]["fr"] | 0;
-  int16_t rl_rpm = doc["m3508_rpms"]["rl"] | 0;
-  int16_t rr_rpm = doc["m3508_rpms"]["rr"] | 0;
+  float fl_rpm = doc["m3508_rpms"]["fl"] | 0.0;
+  float fr_rpm = doc["m3508_rpms"]["fr"] | 0.0;
+  float rl_rpm = doc["m3508_rpms"]["rl"] | 0.0;
+  float rr_rpm = doc["m3508_rpms"]["rr"] | 0.0;
 
-  int16_t target_rpms[4] = {fl_rpm, fr_rpm, rl_rpm, rr_rpm};
+  int16_t target_rpms[4] = {
+      static_cast<int16_t>(fl_rpm), static_cast<int16_t>(fr_rpm),
+      static_cast<int16_t>(rl_rpm), static_cast<int16_t>(rr_rpm)};
   int32_t output_currents[4] = {0, 0, 0, 0};
 
   compute_motor_commands(target_rpms, output_currents);
@@ -178,30 +156,79 @@ void subscription_callback(const void* msgin) {
                                 tx_buf[4], tx_buf[5], tx_buf[6], tx_buf[7]}));
 
   Serial.print("fl: ");
-  Serial.print(fl_rpm);
+  Serial.print(output_currents[0]);
   Serial.print(" fr: ");
-  Serial.print(fr_rpm);
+  Serial.print(output_currents[1]);
   Serial.print(" rl: ");
-  Serial.print(rl_rpm);
+  Serial.print(output_currents[2]);
   Serial.print(" rr: ");
-  Serial.println(rr_rpm);
+  Serial.println(output_currents[3]);
+}
+
+// micro-ROS のセットアップ
+// @see
+// https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/micro-ros_publisher/src/Main.cpp
+// @see https://github.com/micro-ROS/micro-ROS-demos/tree/jazzy/rclc
+void setup_micro_ros() {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL == 1)
+  set_microros_serial_transports(Serial);
+#elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
+  set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
+#endif
+
+  allocator = rcl_get_default_allocator();
+
+  Serial.println("Init support...");
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  Serial.println("Init node...");
+  RCCHECK(rclc_node_init_default(&node, "central_controller", "", &support));
+
+  Serial.println("Init subscription...");
+  RCCHECK(rclc_subscription_init_default(
+      &subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+      "robot_control"));
+
+  // msg の初期化（これがないと callback が発火しなくなる）
+  std_msgs__msg__String__init(&msg);
+
+  const size_t kReceiveBufferSize = 256;
+  msg.data.data = (char*)malloc(kReceiveBufferSize * sizeof(char));
+  msg.data.size = 0;
+  msg.data.capacity = kReceiveBufferSize;
+
+  Serial.println("Init executor...");
+  executor = rclc_executor_get_zero_initialized_executor();
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+
+  Serial.println("Add subscription to executor...");
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg,
+                                         &subscription_callback, ON_NEW_DATA));
 }
 
 void setup() {
   Serial.begin(115200);
 
+  Serial.println("setup start");
+
   // CAN 通信の初期化
   can_comm = new can::CanCommunicator();
   can_comm->setup();
 
+  Serial.println("CAN setup complete");
+
   // micro-ROS のセットアップ
   setup_micro_ros();
 
+  Serial.println("micro-ROS setup complete");
+
   // CAN 通信のイベントハンドラを登録
   register_can_event_handlers();
+
+  Serial.println("Setup complete");
 }
 
 void loop() {
-  delay(100);
-  RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+  delay(1);
 }
