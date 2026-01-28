@@ -52,6 +52,7 @@ void CanCommunicator::transmit(const CanTxMessage message) const {
   tx_msg.header.ide = false;
   tx_msg.header.rtr = false;
   tx_msg.header.dlc = 8;
+  tx_msg.buffer = new uint8_t[8];
   tx_msg.buffer_len = sizeof(message.data);
 
   for (size_t i = 0; i < 8; i++) {
