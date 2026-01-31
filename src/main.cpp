@@ -87,9 +87,6 @@ void register_can_event_handlers() {
 
 // PD 制御
 void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
-  // デバッグ出力はループ周期に悪影響を与えるため削除しました。
-  // 必要なら頻度を落として（例：100回に1回）出力するようにしてください。
-
   static float prev_rpm_errors[4] = {0, 0, 0, 0};
 
   float rpm_errors[4];
