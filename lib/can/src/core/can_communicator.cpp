@@ -10,6 +10,13 @@ constexpr gpio_num_t CAN_RX = GPIO_NUM_4;
 CanCommunicator::CanCommunicator() : receive_event_listeners() {}
 
 void CanCommunicator::setup(twai_filter_config_t filter_config) {
+  // 受信キューの作成
+  rx_queue = xQueueCreate(20, sizeof(CAN_rx_message_t));
+  if (rx_queue == NULL) {
+    Serial.println("Failed to create RX queue!");
+    return;
+  }
+
   twai_onchip_node_config_t node_config = {};
   node_config.io_cfg.tx = CAN_TX;
   node_config.io_cfg.rx = CAN_RX;
@@ -25,16 +32,15 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   }
 
   // receive イベントを登録
-  // twai_event_callbacks_t user_cbs = {};
-  // user_cbs.on_rx_done = &CanCommunicator::receive;
+  twai_event_callbacks_t user_cbs = {};
+  user_cbs.on_rx_done = &CanCommunicator::receive;
 
-  // if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) ==
-  // ESP_OK) {
-  //   Serial.println("Register receive event OK!");
-  // } else {
-  //   Serial.println("Register receive event fail!");
-  //   return;
-  // }
+  if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) == ESP_OK) {
+    Serial.println("Register receive event OK!");
+  } else {
+    Serial.println("Register receive event fail!");
+    return;
+  }
 
   // TWAI コントローラを有効化
   if (twai_node_enable(node_hdl) == ESP_OK) {
@@ -98,11 +104,6 @@ void CanCommunicator::transmit(const CanTxMessage message) const {
   }
 }
 
-void CanCommunicator::receive() const {
-  // Reception is handled by the TWAI ISR callback.
-  // This method is provided to satisfy the CanReceiver interface.
-}
-
 bool CanCommunicator::receive(twai_node_handle_t handle,
                               const twai_rx_done_event_data_t* edata,
                               void* user_ctx) {
@@ -118,7 +119,9 @@ bool CanCommunicator::receive(twai_node_handle_t handle,
   const auto rx_result =
       twai_node_receive_from_isr(communicator->node_hdl, &rx_frame);
   if (rx_result != ESP_OK) {
+#ifdef CAN_DEBUG
     Serial.println("Receive fail: twai_node_receive_from_isr error");
+#endif
     return false;
   }
 
@@ -152,21 +155,38 @@ bool CanCommunicator::receive(twai_node_handle_t handle,
 #endif
   }
 
-  const auto rx_id = rx_frame.header.id;
-  std::array<uint8_t, 8> rx_buf = {};
-  for (uint8_t i = 0; i < 8; i++) {
-    rx_buf[i] = rx_frame.buffer[i];
+  CAN_rx_message_t rx_message;
+  rx_message.id = rx_frame.header.id;
+  rx_message.dlc = rx_frame.header.dlc;
+
+  for (uint8_t i = 0; i < rx_message.dlc; i++) {
+    rx_message.data[i] = rx_frame.buffer[i];
   }
 
-  for (const auto& listener : communicator->receive_event_listeners) {
-    if (std::any_of(
-            listener.first.begin(), listener.first.end(),
-            [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
-      listener.second(rx_id, rx_buf);
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xQueueSendFromISR(communicator->rx_queue, &rx_message,
+                    &xHigherPriorityTaskWoken);
+
+  return xHigherPriorityTaskWoken == pdTRUE;
+}
+
+void CanCommunicator::process_received_messages() {
+  CAN_rx_message_t rx_message;
+  if (xQueueReceive(rx_queue, &rx_message, 0) == pdTRUE) {
+    const auto rx_id = rx_message.id;
+    std::array<uint8_t, 8> rx_buf = {};
+    for (uint8_t i = 0; i < rx_message.dlc; i++) {
+      rx_buf[i] = rx_message.data[i];
+    }
+
+    for (const auto& listener : receive_event_listeners) {
+      if (std::any_of(
+              listener.first.begin(), listener.first.end(),
+              [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
+        listener.second(rx_id, rx_buf);
+      }
     }
   }
-
-  return false;
 }
 
 void CanCommunicator::add_receive_event_listener(

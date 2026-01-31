@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <esp_twai.h>
 #include <esp_twai_onchip.h>
+#include <freertos/queue.h>
 
 #include <vector>
 
@@ -29,7 +30,7 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
   void setup(
       twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
   void transmit(const CanTxMessage message) const override;
-  void receive() const override;
+  void process_received_messages() override;
   void add_receive_event_listener(
       std::vector<can::CanId> listening_can_ids,
       std::function<void(const can::CanId, const std::array<uint8_t, 8>)>
@@ -47,5 +48,8 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
       std::vector<can::CanId>,
       std::function<void(const can::CanId, const std::array<uint8_t, 8>)>>>
       receive_event_listeners;
+
+  /// @brief 受信キュー
+  QueueHandle_t rx_queue;
 };
 }  // namespace can

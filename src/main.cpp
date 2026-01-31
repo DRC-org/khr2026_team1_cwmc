@@ -28,8 +28,11 @@ volatile float current_rpm_fr = 0.0;
 volatile float current_rpm_rl = 0.0;
 volatile float current_rpm_rr = 0.0;
 
-// P 制御用
-#define KP 3.0
+volatile int16_t target_rpms[4] = {0, 0, 0, 0};
+
+// PD 制御用
+#define KP 1.0f
+#define KD 3.0f
 #define CLAMPING_OUTPUT 5000  // 電流値のクランピング値 [mA]
 
 #define RCCHECK(fn)                \
@@ -52,7 +55,7 @@ void error_loop() {
 #if (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
 char ssid[] = "DRC";
 char psk[] = "28228455";
-IPAddress agent_ip(192, 168, 0, 100);
+IPAddress agent_ip(192, 168, 0, 101);
 size_t agent_port = 8888;
 #endif
 
@@ -82,8 +85,13 @@ void register_can_event_handlers() {
       });
 }
 
-// P 制御
+// PD 制御
 void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
+  // デバッグ出力はループ周期に悪影響を与えるため削除しました。
+  // 必要なら頻度を落として（例：100回に1回）出力するようにしてください。
+
+  static float prev_rpm_errors[4] = {0, 0, 0, 0};
+
   float rpm_errors[4];
   rpm_errors[0] = static_cast<float>(target_rpm[0]) - current_rpm_fl;
   rpm_errors[1] = static_cast<float>(target_rpm[1]) - current_rpm_fr;
@@ -91,8 +99,13 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
   rpm_errors[3] = static_cast<float>(target_rpm[3]) - current_rpm_rr;
 
   for (uint8_t i = 0; i < 4; i++) {
+    float error = rpm_errors[i];
+    float d_error = error - prev_rpm_errors[i];
+    prev_rpm_errors[i] = error;
+
     int32_t command_current =
-        static_cast<int32_t>(KP * rpm_errors[i]);  // P 制御
+        static_cast<int32_t>(KP * error + KD * d_error);  // PD 制御
+
     // クランピング
     if (command_current > CLAMPING_OUTPUT) {
       command_current = CLAMPING_OUTPUT;
@@ -122,8 +135,8 @@ void subscription_callback(const void* msgin) {
   const std_msgs__msg__String* msg = (const std_msgs__msg__String*)msgin;
 
   // msg をプレーンテキストで表示（デバッグ用）
-  Serial.print("Received message: ");
-  Serial.println(msg->data.data);
+  // Serial.print("Received message: ");
+  // Serial.println(msg->data.data);
 
   // JSON をパース
   JsonDocument doc;
@@ -140,29 +153,10 @@ void subscription_callback(const void* msgin) {
   float rl_rpm = doc["m3508_rpms"]["rl"] | 0.0;
   float rr_rpm = doc["m3508_rpms"]["rr"] | 0.0;
 
-  int16_t target_rpms[4] = {
-      static_cast<int16_t>(fl_rpm), static_cast<int16_t>(fr_rpm),
-      static_cast<int16_t>(rl_rpm), static_cast<int16_t>(rr_rpm)};
-  int32_t output_currents[4] = {0, 0, 0, 0};
-
-  compute_motor_commands(target_rpms, output_currents);
-
-  uint8_t tx_buf[8];
-  milli_amperes_to_bytes(output_currents, tx_buf);
-
-  // TODO: ↓ この冗長な書き方を何とかしたい
-  can_comm->transmit(
-      can::CanTxMessage(0x200, {tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3],
-                                tx_buf[4], tx_buf[5], tx_buf[6], tx_buf[7]}));
-
-  Serial.print("fl: ");
-  Serial.print(output_currents[0]);
-  Serial.print(" fr: ");
-  Serial.print(output_currents[1]);
-  Serial.print(" rl: ");
-  Serial.print(output_currents[2]);
-  Serial.print(" rr: ");
-  Serial.println(output_currents[3]);
+  target_rpms[0] = static_cast<int16_t>(fl_rpm);
+  target_rpms[1] = static_cast<int16_t>(fr_rpm);
+  target_rpms[2] = static_cast<int16_t>(rl_rpm);
+  target_rpms[3] = static_cast<int16_t>(rr_rpm);
 }
 
 // micro-ROS のセットアップ
@@ -229,6 +223,35 @@ void setup() {
 }
 
 void loop() {
+  // micro-ROS の受信メッセージを処理
   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
-  delay(1);
+
+  // CAN 通信の受信メッセージを処理（受信キューから 1 つずつ）
+  can_comm->process_received_messages();
+
+  // 10ms ごと
+  static unsigned long last_control_time = 0;
+  if (millis() - last_control_time >= 10) {
+    last_control_time = millis();
+
+    int32_t output_currents[4] = {0, 0, 0, 0};
+    int16_t current_target_rpms[4];
+
+    // volatile な値はローカルにコピー
+    noInterrupts();
+    current_target_rpms[0] = target_rpms[0];
+    current_target_rpms[1] = target_rpms[1];
+    current_target_rpms[2] = target_rpms[2];
+    current_target_rpms[3] = target_rpms[3];
+    interrupts();
+
+    compute_motor_commands(current_target_rpms, output_currents);
+
+    uint8_t tx_buf[8];
+    milli_amperes_to_bytes(output_currents, tx_buf);
+
+    can_comm->transmit(
+        can::CanTxMessage(0x200, {tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3],
+                                  tx_buf[4], tx_buf[5], tx_buf[6], tx_buf[7]}));
+  }
 }
