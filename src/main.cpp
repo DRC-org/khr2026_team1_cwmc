@@ -10,8 +10,11 @@
 #include <can/core.hpp>
 #include <can/peripheral.hpp>
 
+rcl_publisher_t publisher;
 rcl_subscription_t subscriber;
-std_msgs__msg__String msg;
+rcl_timer_t timer;
+std_msgs__msg__String send_msg;
+std_msgs__msg__String recv_msg;
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -31,9 +34,10 @@ volatile float current_rpm_rr = 0.0;
 volatile int16_t target_rpms[4] = {0, 0, 0, 0};
 
 // PD 制御用
-#define KP 1.0f
-#define KD 3.0f
-#define CLAMPING_OUTPUT 5000  // 電流値のクランピング値 [mA]
+#define KP 0.9f
+#define KD 100.0f
+#define CLAMPING_OUTPUT 5000      // 電流値のクランピング値 [mA]
+#define STOP_THRESHOLD_RPM 50.0f  // 停止判定の閾値 [RPM]
 
 #define RCCHECK(fn)                \
   {                                \
@@ -41,6 +45,15 @@ volatile int16_t target_rpms[4] = {0, 0, 0, 0};
     if ((temp_rc != RCL_RET_OK)) { \
       error_loop();                \
     }                              \
+  }
+
+#define RCSOFTCHECK(fn)             \
+  {                                 \
+    rcl_ret_t temp_rc = fn;         \
+    if ((temp_rc != RCL_RET_OK)) {  \
+      Serial.print("Soft error: "); \
+      Serial.println(temp_rc);      \
+    }                               \
   }
 
 // TODO: エラー発生時の対処は何とかする
@@ -100,8 +113,16 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
     float d_error = error - prev_rpm_errors[i];
     prev_rpm_errors[i] = error;
 
-    int32_t command_current =
-        static_cast<int32_t>(KP * error + KD * d_error);  // PD 制御
+    int32_t command_current = 0;
+
+    // 目標 RPM が 0 のときのハンチング防止：閾値以下なら出力を 0 にする
+    if (target_rpm[i] == 0 /* && fabs(error) < STOP_THRESHOLD_RPM */) {
+      command_current = 0;
+      prev_rpm_errors[i] = 0.0f;  // 微分項の蓄積もリセット
+    } else {
+      command_current =
+          static_cast<int32_t>(KP * error + KD * d_error);  // PD 制御
+    }
 
     // クランピング
     if (command_current > CLAMPING_OUTPUT) {
@@ -128,7 +149,7 @@ void milli_amperes_to_bytes(const int32_t milli_amperes[4],
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 // rspi からの JSON を受け取る
-void subscription_callback(const void* msgin) {
+IRAM_ATTR void subscription_callback(const void* msgin) {
   const std_msgs__msg__String* msg = (const std_msgs__msg__String*)msgin;
 
   // msg をプレーンテキストで表示（デバッグ用）
@@ -156,6 +177,21 @@ void subscription_callback(const void* msgin) {
   target_rpms[3] = static_cast<int16_t>(rr_rpm);
 }
 
+// rspi にフィードバック値を送る
+void timer_callback(rcl_timer_t* timer, int64_t last_call_time) {
+  // フィードバック値を JSON にシリアライズ
+  StaticJsonDocument<256> doc;
+  doc["m3508_rpms"]["fl"] = current_rpm_fl;
+  doc["m3508_rpms"]["fr"] = current_rpm_fr;
+  doc["m3508_rpms"]["rl"] = current_rpm_rl;
+  doc["m3508_rpms"]["rr"] = current_rpm_rr;
+
+  size_t n = serializeJson(doc, send_msg.data.data, send_msg.data.capacity);
+  send_msg.data.size = n;
+
+  RCSOFTCHECK(rcl_publish(&publisher, &send_msg, NULL));
+}
+
 // micro-ROS のセットアップ
 // @see
 // https://github.com/micro-ROS/micro_ros_platformio/blob/main/examples/micro-ros_publisher/src/Main.cpp
@@ -175,25 +211,42 @@ void setup_micro_ros() {
   Serial.println("Init node...");
   RCCHECK(rclc_node_init_default(&node, "central_controller", "", &support));
 
+  Serial.println("Init publisher...");
+  RCCHECK(rclc_publisher_init_default(
+      &publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+      "robot_feedback"));
+
   Serial.println("Init subscription...");
   RCCHECK(rclc_subscription_init_default(
       &subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
       "robot_control"));
 
-  // msg の初期化（これがないと callback が発火しなくなる）
-  std_msgs__msg__String__init(&msg);
+  const unsigned int timer_timeout = 500;
+  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(timer_timeout),
+                                  timer_callback));
 
-  const size_t kReceiveBufferSize = 256;
-  msg.data.data = (char*)malloc(kReceiveBufferSize * sizeof(char));
-  msg.data.size = 0;
-  msg.data.capacity = kReceiveBufferSize;
+  // msg の初期化（これがないと callback が発火しなくなる）
+  std_msgs__msg__String__init(&recv_msg);
+  std_msgs__msg__String__init(&send_msg);
+
+  const size_t kBufferSize = 256;
+  recv_msg.data.data = (char*)malloc(kBufferSize * sizeof(char));
+  recv_msg.data.size = 0;
+  recv_msg.data.capacity = kBufferSize;
+
+  send_msg.data.data = (char*)malloc(kBufferSize * sizeof(char));
+  send_msg.data.size = 0;
+  send_msg.data.capacity = kBufferSize;
 
   Serial.println("Init executor...");
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+
+  Serial.println("Add timer to executor...");
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
 
   Serial.println("Add subscription to executor...");
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg,
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &recv_msg,
                                          &subscription_callback, ON_NEW_DATA));
 }
 
@@ -221,15 +274,25 @@ void setup() {
 
 void loop() {
   // micro-ROS の受信メッセージを処理
-  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
 
   // CAN 通信の受信メッセージを処理（受信キューから 1 つずつ）
   can_comm->process_received_messages();
 
-  // 10ms ごと
+  // 3ms ごと
   static unsigned long last_control_time = 0;
-  if (millis() - last_control_time >= 10) {
+  if (millis() - last_control_time >= 3) {
     last_control_time = millis();
+
+    // for debug
+    Serial.print("fl: ");
+    Serial.print(current_rpm_fl);
+    Serial.print(", fr: ");
+    Serial.print(current_rpm_fr);
+    Serial.print(", rl: ");
+    Serial.print(current_rpm_rl);
+    Serial.print(", rr: ");
+    Serial.println(current_rpm_rr);
 
     int32_t output_currents[4] = {0, 0, 0, 0};
     int16_t current_target_rpms[4];
