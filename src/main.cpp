@@ -26,10 +26,10 @@ can::CanCommunicator* can_comm;
 // setup より前に使うので前方宣言しておく
 // void subscription_callback(const void* msgin);
 
-volatile float current_rpm_fl = 0.0;
-volatile float current_rpm_fr = 0.0;
-volatile float current_rpm_rl = 0.0;
-volatile float current_rpm_rr = 0.0;
+volatile int16_t current_rpm_fl = 0;
+volatile int16_t current_rpm_fr = 0;
+volatile int16_t current_rpm_rl = 0;
+volatile int16_t current_rpm_rr = 0;
 
 volatile int16_t target_rpms[4] = {0, 0, 0, 0};
 
@@ -81,16 +81,16 @@ void register_can_event_handlers() {
         int16_t rpm = (data[2] << 8) | data[3];
         switch (id) {
           case 0x201:
-            current_rpm_fl = static_cast<float>(rpm);
+            current_rpm_fl = rpm;
             break;
           case 0x202:
-            current_rpm_fr = static_cast<float>(rpm);
+            current_rpm_fr = rpm;
             break;
           case 0x203:
-            current_rpm_rl = static_cast<float>(rpm);
+            current_rpm_rl = rpm;
             break;
           case 0x204:
-            current_rpm_rr = static_cast<float>(rpm);
+            current_rpm_rr = rpm;
             break;
           default:
             break;
@@ -285,14 +285,14 @@ void loop() {
     last_control_time = millis();
 
     // for debug
-    Serial.print("fl: ");
-    Serial.print(current_rpm_fl);
-    Serial.print(", fr: ");
-    Serial.print(current_rpm_fr);
-    Serial.print(", rl: ");
-    Serial.print(current_rpm_rl);
-    Serial.print(", rr: ");
-    Serial.println(current_rpm_rr);
+    // Serial.print("fl: ");
+    // Serial.print(current_rpm_fl);
+    // Serial.print(", fr: ");
+    // Serial.print(current_rpm_fr);
+    // Serial.print(", rl: ");
+    // Serial.print(current_rpm_rl);
+    // Serial.print(", rr: ");
+    // Serial.println(current_rpm_rr);
 
     int32_t output_currents[4] = {0, 0, 0, 0};
     int16_t current_target_rpms[4];
