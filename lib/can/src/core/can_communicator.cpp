@@ -4,7 +4,7 @@
 // 【重要】お使いのボードに合わせてピン番号を変更してください
 // 一般的なESP32でのCANピン設定例 (GPIO 5, 4)
 #ifndef CAN_TX
-#define CAN_TX GPIO_NUM_5
+#define CAN_TX GPIO_NUM_16
 #endif
 #ifndef CAN_RX
 #define CAN_RX GPIO_NUM_4
@@ -18,11 +18,20 @@ CanCommunicator::CanCommunicator() {
 
 void CanCommunicator::setup(twai_filter_config_t filter_config) {
     // 1. 一般設定 (TXピン, RXピン, モード設定)
+    // バスオフ状態からの自動復帰を有効にするため TWAI_ALERT_BUS_RECOVERED を監視するか、
+    // あるいは単純にドライバの自動復帰機能を信頼して運用します。
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
+    g_config.tx_queue_len = 50;
+    g_config.rx_queue_len = 50;
+    // エラー時に自動でバスオフから復帰するように設定（重要）
+    // これを設定しないと、エラーが蓄積してバスオフになった際、手動でリセットしない限り復帰できません
+    // ただし、ESP-IDFのバージョンによっては構造体のメンバ名が異なる場合があるため注意が必要ですが、
+    // Arduino-ESP32 では通常デフォルトで自動復帰は無効です。
+    // ここではドライバ再起動を試みるロジックを別途入れるか、またはアラートを監視するのが定石です。
     
-    // 2. タイミング設定 (500kbit/s)
+    // 2. タイミング設定 (1Mbit/s)
     // 通信相手のビットレートと必ず合わせる必要があります
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
 
     // 3. フィルタ設定 (引数から受け取る)
     twai_filter_config_t f_config = filter_config;
@@ -61,7 +70,28 @@ void CanCommunicator::transmit(const CanTxMessage message) const {
     // 送信キューに入れる (タイムアウト100ms)
     // 送信成功ではなく「キューに入ったか」を確認しています
     if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
-        Serial.println("Failed to queue message for transmission");
+    if (twai_transmit(&tx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
+        // エラー詳細を表示
+        uint32_t alerts = 0;
+        twai_read_alerts(&alerts, 0);
+        twai_status_info_t status_info;
+        twai_get_status_info(&status_info);
+        
+        Serial.print("Failed to queue message. State: ");
+        Serial.print(status_info.state);
+        Serial.print(", TED: ");
+        Serial.print(status_info.tx_error_counter);
+        Serial.print(", RED: ");
+        Serial.print(status_info.rx_error_counter);
+        Serial.print(", Alerts: ");
+        Serial.println(alerts, HEX);
+
+        // バスオフ状態なら復旧を試みる（簡易的な処置）
+        if (status_info.state == TWAI_STATE_BUS_OFF) {
+            Serial.println("Bus Off detected. Initiating recovery...");
+            twai_initiate_recovery();
+        }
+    }
     }
 }
 
@@ -79,6 +109,16 @@ void CanCommunicator::process_received_messages() {
             for(int i=0; i<8; i++) {
                 data_array[i] = rx_msg.data[i];
             }
+
+            // 【デバッグ用】全受信メッセージをログ出力
+            // Serial.print("CAN RX ID: 0x");
+            // Serial.print(rx_msg.identifier, HEX);
+            // Serial.print(" Data: ");
+            // for(int i=0; i<8; i++) {
+            //     Serial.print(data_array[i], HEX);
+            //     Serial.print(" ");
+            // }
+            // Serial.println();
 
             // 登録されたリスナーに通知
             for (const auto& listener_pair : receive_event_listeners) {
