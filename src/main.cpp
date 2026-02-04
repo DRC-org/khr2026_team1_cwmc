@@ -13,6 +13,7 @@
 
 #include <can/core.hpp>
 #include <can/peripheral.hpp>
+#include <lsm9ds1_control.hpp>
 
 // タスクハンドル定義
 TaskHandle_t MicroROSTaskHandle = NULL;
@@ -30,6 +31,7 @@ rcl_allocator_t allocator;
 rcl_node_t node;
 
 can::CanCommunicator* can_comm;
+lsm9ds1_control::Lsm9ds1Controller imu_controller;
 
 volatile int16_t current_rpm_fl = 0;
 volatile int16_t current_rpm_fr = 0;
@@ -38,9 +40,11 @@ volatile int16_t current_rpm_rr = 0;
 
 volatile int16_t target_rpms[4] = {0, 0, 0, 0};
 
-// ロボットパラメータ（実測値に変更すること！）
-const float WHEEL_RADIUS = 0.05f;      // [m] ホイール半径
-const float WHEEL_BASE = 0.3f;         // [m] 左右ホイール間距離
+// メカナムロボットパラメータ
+const float WHEEL_RADIUS = 0.04925f; // [m]
+const float LX = 0.1725f;            // [m] ロボット中心からホイールまでの前後距離 (Machine center to wheel center X)
+const float LY = 0.2425f;            // [m] ロボット中心からホイールまでの左右距離 (Machine center to wheel center Y)
+const float GEAR_RATIO = 19.2032f;   // ギア比 (M3508 P19)
 
 // オドメトリ用変数
 float odom_x = 0.0f;
@@ -192,21 +196,28 @@ void milli_amperes_to_bytes(const int32_t milli_amperes[4],
   }
 }
 
-// cmd_vel (m/s, rad/s) → モーターRPM に変換
-void cmd_vel_to_rpm(float linear_vel, float angular_vel, int16_t out_rpms[4]) {
-    // 左右の車輪速度を計算 [m/s]
-    float left_vel = linear_vel - (angular_vel * WHEEL_BASE / 2.0f);
-    float right_vel = linear_vel + (angular_vel * WHEEL_BASE / 2.0f);
+// cmd_vel (m/s, rad/s) → モーターRPM に変換 (メカナム逆運動学)
+void cmd_vel_to_rpm(float vx, float vy, float vth, int16_t out_rpms[4]) {
+    // 逆運動学計算
+    // ホイール配置:
+    // FL(0)   FR(1)
+    //    Robot
+    // RL(2)   RR(3)
     
-    // RPMに変換
-    float left_rpm = (left_vel / (2.0f * PI * WHEEL_RADIUS)) * 60.0f;
-    float right_rpm = (right_vel / (2.0f * PI * WHEEL_RADIUS)) * 60.0f;
+    // 各ホイールの目標速度 [m/s]
+    float v_fl = vx - vy - (LX + LY) * vth;
+    float v_fr = vx + vy + (LX + LY) * vth;
+    float v_rl = vx + vy - (LX + LY) * vth;
+    float v_rr = vx - vy + (LX + LY) * vth;
     
-    // 4輪駆動の場合（前後同じ速度）
-    out_rpms[0] = static_cast<int16_t>(left_rpm);   // FL
-    out_rpms[1] = static_cast<int16_t>(right_rpm);  // FR
-    out_rpms[2] = static_cast<int16_t>(left_rpm);   // RL
-    out_rpms[3] = static_cast<int16_t>(right_rpm);  // RR
+    // m/s -> RPM 変換 (ギア比込み)
+    // RPM = (v * 60 * GEAR_RATIO) / (2 * PI * R)
+    float rad_to_rpm_coeff = (60.0f * GEAR_RATIO) / (2.0f * PI * WHEEL_RADIUS);
+    
+    out_rpms[0] = static_cast<int16_t>(v_fl * rad_to_rpm_coeff); // FL
+    out_rpms[1] = static_cast<int16_t>(v_fr * rad_to_rpm_coeff); // FR
+    out_rpms[2] = static_cast<int16_t>(v_rl * rad_to_rpm_coeff); // RL
+    out_rpms[3] = static_cast<int16_t>(v_rr * rad_to_rpm_coeff); // RR
 }
 
 // エンコーダー値からオドメトリを計算
@@ -229,49 +240,73 @@ void update_odometry() {
         return;
     }
     
-    // 左右の平均RPMから速度を計算
-    float left_rpm = (current_rpms[0] + current_rpms[2]) / 2.0f;
-    float right_rpm = (current_rpms[1] + current_rpms[3]) / 2.0f;
+    // RPM から ホイール速度 [m/s] への変換係数
+    // v = (RPM / 60 / GEAR_RATIO) * 2 * PI * R
+    float rpm_to_vel_coeff = (2.0f * PI * WHEEL_RADIUS) / (60.0f * GEAR_RATIO);
     
-    // RPM → m/s
-    float left_vel = (left_rpm / 60.0f) * (2.0f * PI * WHEEL_RADIUS);
-    float right_vel = (right_rpm / 60.0f) * (2.0f * PI * WHEEL_RADIUS);
+    float v_fl = current_rpms[0] * rpm_to_vel_coeff;
+    float v_fr = current_rpms[1] * rpm_to_vel_coeff;
+    float v_rl = current_rpms[2] * rpm_to_vel_coeff;
+    float v_rr = current_rpms[3] * rpm_to_vel_coeff;
     
-    // ロボット速度
-    float linear_vel = (left_vel + right_vel) / 2.0f;
-    float angular_vel = (right_vel - left_vel) / WHEEL_BASE;
+    // メカナム順運動学: ロボットローカル座標系の速度 (vx, vy)
+    float vx  = (v_fl + v_fr + v_rl + v_rr) / 4.0f;
+    float vy  = (-v_fl + v_fr + v_rl - v_rr) / 4.0f;
+    // float vth_wheels = (-v_fl + v_fr - v_rl + v_rr) / (4.0f * (LX + LY));
     
-    // 位置を積分
-    float delta_theta = angular_vel * dt;
-    float delta_x = linear_vel * cos(odom_theta + delta_theta / 2.0f) * dt;
-    float delta_y = linear_vel * sin(odom_theta + delta_theta / 2.0f) * dt;
+    // IMUからYaw角を取得してオドメトリの角度に設定
+    float yaw_deg = imu_controller.get_yaw();
+    float new_odom_theta = yaw_deg * DEG_TO_RAD;
+
+    // 角速度を算出（前回の角度との差分）
+    static float prev_odom_theta = 0.0f;
+    float delta_theta = new_odom_theta - prev_odom_theta;
+    
+    // 角度の正規化処理（-PI ~ PIの境界またぎ対策）
+    if (delta_theta > PI) delta_theta -= 2.0f * PI;
+    if (delta_theta < -PI) delta_theta += 2.0f * PI;
+
+    float vth_imu = delta_theta / dt;
+    prev_odom_theta = new_odom_theta;
+    odom_theta = new_odom_theta;
+
+    // 現在の角度(odom_theta)を使って、ローカル速度(vx, vy)をグローバル移動量(delta_x, delta_y)に変換
+    // 回転行列:
+    // [ dx ] = [ cos -sin ] [ vx ]
+    // [ dy ] = [ sin  cos ] [ vy ]
+    float cos_th = cos(odom_theta);
+    float sin_th = sin(odom_theta);
+    
+    float delta_x = (vx * cos_th - vy * sin_th) * dt;
+    float delta_y = (vx * sin_th + vy * cos_th) * dt;
     
     odom_x += delta_x;
     odom_y += delta_y;
-    odom_theta += delta_theta;
-    
-    // -π ~ π に正規化
-    while (odom_theta > PI) odom_theta -= 2.0f * PI;
-    while (odom_theta < -PI) odom_theta += 2.0f * PI;
     
     // オドメトリメッセージに格納
     odom_msg.pose.pose.position.x = odom_x;
     odom_msg.pose.pose.position.y = odom_y;
+    
+    // クォータニオンなど (変更なし)
+    odom_msg.pose.pose.orientation.z = sin(odom_theta / 2.0f);
+    odom_msg.pose.pose.orientation.w = cos(odom_theta / 2.0f);
+    
+    // 速度 (Twist) - ローカル座標系の速度
+    odom_msg.twist.twist.linear.x = vx;
+    odom_msg.twist.twist.linear.y = vy;
+    odom_msg.twist.twist.angular.z = vth_imu;
     odom_msg.pose.pose.position.z = 0.0;
     
     // クォータニオン（Z軸回転のみ）
     odom_msg.pose.pose.orientation.x = 0.0;
     odom_msg.pose.pose.orientation.y = 0.0;
-    odom_msg.pose.pose.orientation.z = sin(odom_theta / 2.0f);
-    odom_msg.pose.pose.orientation.w = cos(odom_theta / 2.0f);
+    // z, w は上で設定済み
     
-    // 速度
-    odom_msg.twist.twist.linear.x = linear_vel;
-    odom_msg.twist.twist.linear.y = 0.0;
+    // 速度 (Twist) - 残りの成分を0に
+    // linear.x, y, angular.z は上で設定済み
     odom_msg.twist.twist.linear.z = 0.0;
     odom_msg.twist.twist.angular.x = 0.0;
     odom_msg.twist.twist.angular.y = 0.0;
-    odom_msg.twist.twist.angular.z = angular_vel;
     
     // タイムスタンプ（簡易版）
     odom_msg.header.stamp.sec = current_time / 1000;
@@ -282,12 +317,13 @@ void update_odometry() {
 IRAM_ATTR void cmd_vel_callback(const void* msgin) {
     const geometry_msgs__msg__Twist* msg = (const geometry_msgs__msg__Twist*)msgin;
     
-    float linear_vel = msg->linear.x;
-    float angular_vel = msg->angular.z;
+    float vx = msg->linear.x;
+    float vy = msg->linear.y;
+    float vth = msg->angular.z;
     
     // 速度をRPMに変換
     int16_t new_target_rpms[4];
-    cmd_vel_to_rpm(linear_vel, angular_vel, new_target_rpms);
+    cmd_vel_to_rpm(vx, vy, vth, new_target_rpms);
     
     // Mutexで保護して書き込み
     if(xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
@@ -452,6 +488,11 @@ void setup() {
   can_comm = new can::CanCommunicator();
   can_comm->setup();
   Serial.println("CAN setup complete");
+
+  // IMU初期化
+  imu_controller.setup();
+  imu_controller.reset_yaw();
+  Serial.println("IMU setup complete");
 
   // CAN 通信のイベントハンドラを登録
   register_can_event_handlers();
