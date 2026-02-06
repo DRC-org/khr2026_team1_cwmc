@@ -44,10 +44,10 @@ volatile float p_terms_fb[4] = {0, 0, 0, 0};
 volatile float i_terms_fb[4] = {0, 0, 0, 0};
 volatile float d_terms_fb[4] = {0, 0, 0, 0};
 
-// PID 制御用
-#define KP 0.5f
-#define KI 0.05f  // 積分ゲイン
-#define KD 0.0f
+// PID 制御用（ランタイムで変更可能）
+volatile float pid_kp = 0.5f;
+volatile float pid_ki = 0.05f;
+volatile float pid_kd = 0.0f;
 #define DT 0.003f  // 制御周期 [秒] (3ms)
 
 #define CLAMPING_OUTPUT \
@@ -125,11 +125,16 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
 
   // Mutexで保護して読み込み
   int16_t current_rpms[4];
+  float local_kp, local_ki, local_kd;
   if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
     current_rpms[0] = current_rpm_fl;
     current_rpms[1] = current_rpm_fr;
     current_rpms[2] = current_rpm_rl;
     current_rpms[3] = current_rpm_rr;
+    // PIDゲインもコピー
+    local_kp = pid_kp;
+    local_ki = pid_ki;
+    local_kd = pid_kd;
     xSemaphoreGive(DataMutex);
   } else {
     // 取得失敗時は前回値か0を使うなどの対策が必要だが、portMAX_DELAYなので基本ここには来ない
@@ -159,9 +164,9 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
     } else { */
 
     // PID 制御の計算（仮の出力）
-    float p_term = KP * error;
-    float i_term = KI * integral_errors[i];
-    float d_term = KD * d_error;
+    float p_term = local_kp * error;
+    float i_term = local_ki * integral_errors[i];
+    float d_term = local_kd * d_error;
     float pid_output = p_term + i_term + d_term;
 
     command_current = static_cast<int32_t>(pid_output);
@@ -230,18 +235,48 @@ IRAM_ATTR void subscription_callback(const void* msgin) {
     return;
   }
 
-  float fl_rpm = doc["m3508_rpms"]["fl"] | 0.0;
-  float fr_rpm = doc["m3508_rpms"]["fr"] | 0.0;
-  float rl_rpm = doc["m3508_rpms"]["rl"] | 0.0;
-  float rr_rpm = doc["m3508_rpms"]["rr"] | 0.0;
+  // m3508_rpms コマンドの処理
+  if (doc.containsKey("m3508_rpms")) {
+    float fl_rpm = doc["m3508_rpms"]["fl"] | 0.0;
+    float fr_rpm = doc["m3508_rpms"]["fr"] | 0.0;
+    float rl_rpm = doc["m3508_rpms"]["rl"] | 0.0;
+    float rr_rpm = doc["m3508_rpms"]["rr"] | 0.0;
 
-  // Mutexで保護して書き込み
-  if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
-    target_rpms[0] = static_cast<int16_t>(fl_rpm);
-    target_rpms[1] = static_cast<int16_t>(fr_rpm);
-    target_rpms[2] = static_cast<int16_t>(rl_rpm);
-    target_rpms[3] = static_cast<int16_t>(rr_rpm);
-    xSemaphoreGive(DataMutex);
+    // Mutexで保護して書き込み
+    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+      target_rpms[0] = static_cast<int16_t>(fl_rpm);
+      target_rpms[1] = static_cast<int16_t>(fr_rpm);
+      target_rpms[2] = static_cast<int16_t>(rl_rpm);
+      target_rpms[3] = static_cast<int16_t>(rr_rpm);
+      xSemaphoreGive(DataMutex);
+    }
+  }
+
+  // pid_gains コマンドの処理
+  if (doc.containsKey("pid_gains")) {
+    float new_kp = doc["pid_gains"]["kp"] | pid_kp;
+    float new_ki = doc["pid_gains"]["ki"] | pid_ki;
+    float new_kd = doc["pid_gains"]["kd"] | pid_kd;
+
+    // 範囲チェック
+    new_kp = constrain(new_kp, 0.0f, 10.0f);
+    new_ki = constrain(new_ki, 0.0f, 1.0f);
+    new_kd = constrain(new_kd, 0.0f, 1.0f);
+
+    // Mutexで保護して書き込み
+    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+      pid_kp = new_kp;
+      pid_ki = new_ki;
+      pid_kd = new_kd;
+      xSemaphoreGive(DataMutex);
+    }
+
+    Serial.print("PID gains updated: Kp=");
+    Serial.print(pid_kp);
+    Serial.print(", Ki=");
+    Serial.print(pid_ki);
+    Serial.print(", Kd=");
+    Serial.println(pid_kd);
   }
 }
 
@@ -287,6 +322,11 @@ void timer_callback(rcl_timer_t* timer, int64_t last_call_time) {
     doc["d_terms"]["fr"] = d_terms_fb[1];
     doc["d_terms"]["rl"] = d_terms_fb[2];
     doc["d_terms"]["rr"] = d_terms_fb[3];
+
+    // 現在のPIDゲイン
+    doc["pid_gains"]["kp"] = pid_kp;
+    doc["pid_gains"]["ki"] = pid_ki;
+    doc["pid_gains"]["kd"] = pid_kd;
 
     xSemaphoreGive(DataMutex);
   }
