@@ -24,7 +24,7 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
   void setup(twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
 
   /// @brief メッセージ送信
-  void transmit(const CanTxMessage message) const override;
+  void transmit(const CanTxMessage message) override;
 
   /// @brief 受信処理（loop内で呼ぶ）
   void process_received_messages() override;
@@ -35,8 +35,11 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
       std::function<void(const can::CanId, const std::array<uint8_t, 8>)> listener) override;
 
  private:
-  // node_hdl は標準ドライバには存在しないので削除しました
-  // その代わり、必要なメンバ変数があればここに追加します
+  void restart_driver();
+
+  twai_general_config_t g_config_;
+  twai_timing_config_t t_config_;
+  twai_filter_config_t f_config_;
 
   /// @brief CAN受信時のイベントリスナのリスト
   std::vector<std::pair<

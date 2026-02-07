@@ -95,25 +95,22 @@ void register_can_event_handlers() {
       [&](const can::CanId id, const std::array<uint8_t, 8> data) {
         int16_t rpm = (data[2] << 8) | data[3];
 
-        // Mutexで保護して書き込み
-        if (xSemaphoreTake(DataMutex, 0) == pdTRUE) {
-          switch (id) {
-            case 0x201:
-              current_rpm_fl = rpm;
-              break;
-            case 0x202:
-              current_rpm_fr = rpm;
-              break;
-            case 0x203:
-              current_rpm_rl = rpm;
-              break;
-            case 0x204:
-              current_rpm_rr = rpm;
-              break;
-            default:
-              break;
-          }
-          xSemaphoreGive(DataMutex);
+        // volatile int16_t への書き込みは ESP32 でアトミック。
+        // Mutex を使うと Core 0 の micro-ROS タスクとの競合で
+        // フィードバックがドロップされるため、ここでは使わない。
+        switch (id) {
+          case 0x201:
+            current_rpm_fl = rpm;
+            break;
+          case 0x202:
+            current_rpm_fr = rpm;
+            break;
+          case 0x203:
+            current_rpm_rl = rpm;
+            break;
+          case 0x204:
+            current_rpm_rr = rpm;
+            break;
         }
       });
 }
@@ -155,46 +152,44 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
     prev_rpm_errors[i] = error;
 
     int32_t command_current = 0;
+    float p_term = 0.0f;
+    float i_term = 0.0f;
+    float d_term = 0.0f;
 
-    // 目標 RPM が 0 のときのハンチング防止：閾値以下なら出力を 0 にする
-    /* if (target_rpm[i] == 0 && fabs(error) < STOP_THRESHOLD_RPM) {
-      command_current = 0;
-      prev_rpm_errors[i] = 0.0f;  // 微分項の蓄積もリセット
-      integral_errors[i] = 0.0f;  // 積分項もリセット
-    } else { */
+    // 目標 RPM が 0 のとき：積分項をリセットして出力を 0 にする
+    if (target_rpm[i] == 0) {
+      prev_rpm_errors[i] = 0.0f;
+      integral_errors[i] = 0.0f;
+    } else {
+      // PID 制御の計算
+      p_term = local_kp * error;
+      i_term = local_ki * integral_errors[i];
+      d_term = local_kd * d_error;
+      float pid_output = p_term + i_term + d_term;
 
-    // PID 制御の計算（仮の出力）
-    float p_term = local_kp * error;
-    float i_term = local_ki * integral_errors[i];
-    float d_term = local_kd * d_error;
-    float pid_output = p_term + i_term + d_term;
+      command_current = static_cast<int32_t>(pid_output);
 
-    command_current = static_cast<int32_t>(pid_output);
+      // クランピング前の値を保存
+      int32_t unclamped_current = command_current;
 
-    // クランピング前の値を保存
-    int32_t unclamped_current = command_current;
+      // クランピング
+      if (command_current > CLAMPING_OUTPUT) {
+        command_current = CLAMPING_OUTPUT;
+      } else if (command_current < -CLAMPING_OUTPUT) {
+        command_current = -CLAMPING_OUTPUT;
+      }
 
-    // クランピング
-    if (command_current > CLAMPING_OUTPUT) {
-      command_current = CLAMPING_OUTPUT;
-    } else if (command_current < -CLAMPING_OUTPUT) {
-      command_current = -CLAMPING_OUTPUT;
-    }
+      // Anti-windup: 出力が飽和していない場合のみ積分を更新
+      if (command_current == unclamped_current) {
+        integral_errors[i] += error * DT;
 
-    // Anti-windup: 出力が飽和していない場合のみ積分を更新
-    if (command_current == unclamped_current) {
-      // 飽和していない場合は積分を更新
-      integral_errors[i] += error * DT;
-
-      // 積分項自体にも上限を設定
-      if (integral_errors[i] > INTEGRAL_LIMIT) {
-        integral_errors[i] = INTEGRAL_LIMIT;
-      } else if (integral_errors[i] < -INTEGRAL_LIMIT) {
-        integral_errors[i] = -INTEGRAL_LIMIT;
+        if (integral_errors[i] > INTEGRAL_LIMIT) {
+          integral_errors[i] = INTEGRAL_LIMIT;
+        } else if (integral_errors[i] < -INTEGRAL_LIMIT) {
+          integral_errors[i] = -INTEGRAL_LIMIT;
+        }
       }
     }
-    // 飽和している場合は積分を更新しない（Anti-windup）
-    // }
 
     out_current[i] = command_current;
 
@@ -441,6 +436,16 @@ void ControlTask(void* pvParameters) {
       Serial.print(current_target_rpms[3]);
       Serial.println("]");
 
+      Serial.print("Current RPM: [");
+      Serial.print(current_rpm_fl);
+      Serial.print(", ");
+      Serial.print(current_rpm_fr);
+      Serial.print(", ");
+      Serial.print(current_rpm_rl);
+      Serial.print(", ");
+      Serial.print(current_rpm_rr);
+      Serial.println("]");
+
       Serial.print("Out Current: [");
       Serial.print(output_currents[0]);
       Serial.print(", ");
@@ -485,7 +490,7 @@ void setup() {
   // Mutex作成
   DataMutex = xSemaphoreCreateMutex();
 
-  // CAN 通信の初期化
+  // CAN 通信の初期化（フィルタなし＝全受信）
   can_comm = new can::CanCommunicator();
   can_comm->setup();
   Serial.println("CAN setup complete");

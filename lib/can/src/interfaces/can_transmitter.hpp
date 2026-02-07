@@ -12,6 +12,6 @@ class CanTransmitter {
 
   /// @brief CAN通信を送信します。
   /// @param message 送信するCANメッセージ
-  virtual void transmit(const CanTxMessage message) const = 0;
+  virtual void transmit(const CanTxMessage message) = 0;
 };
 }  // namespace can
