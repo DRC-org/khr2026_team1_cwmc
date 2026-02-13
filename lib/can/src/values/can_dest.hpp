@@ -3,20 +3,25 @@
 #include "can_id.hpp"
 
 namespace can {
-/// @brief モジュールとCAN IDを対応させるenumです。
+/**
+ * @brief CAN 1 & 2 Modules (Based on can.md)
+ */
 enum class CanDest : can::CanId {
-  central = 0x000,
-  dc_0 = 0x100,
-  dc_1 = 0x101,
-  dc_2 = 0x102,
-  power_0 = 0x400,
-  power_1 = 0x401,
-  servo_cone = 0x300,
-  servo_ball = 0x301,
-  m3508_1 = 0x201,
-  m3508_2 = 0x202,
-  m3508_3 = 0x203,
-  m3508_4 = 0x204,
+  // CAN 1: Mechanism System
+  central_mech = 0x000,
+  power_12v    = 0x100,
+  dc_lift      = 0x300,
+  servo_yagura = 0x400,
+  servo_ring   = 0x401,
+
+  // CAN 2: Drive System
+  central_drive = 0x001,
+  power_24v     = 0x101,
+  m3508_ctrl    = 0x200,
+  m3508_1_fb    = 0x201,
+  m3508_2_fb    = 0x202,
+  m3508_3_fb    = 0x203,
+  m3508_4_fb    = 0x204,
 };
 
 constexpr bool operator==(const can::CanId id, const can::CanDest dest) {

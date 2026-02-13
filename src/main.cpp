@@ -98,10 +98,16 @@ size_t agent_port = 8888;
 #endif
 
 void register_can_event_handlers() {
-  // M3508 のフィードバック値を受け取る
+  // M3508 のフィードバック値およびバッテリ電圧を受け取る
   can_comm->add_receive_event_listener(
-      {0x201, 0x202, 0x203, 0x204},
+      {0x201, 0x202, 0x203, 0x204, 0x101},
       [&](const can::CanId id, const std::array<uint8_t, 8> data) {
+        if (id == 0x101) {
+          float voltage = (float)((data[1] << 8) | data[2]) / 100.0f;
+          Serial.print("Battery 24V: "); Serial.println(voltage);
+          return;
+        }
+
         int16_t rpm = (data[2] << 8) | data[3];
 
         // Mutexで保護して書き込み
