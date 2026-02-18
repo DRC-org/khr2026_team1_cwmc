@@ -1,15 +1,14 @@
 #pragma once
 
 #include <Arduino.h>
-#include <vector>
-#include <functional> // std::functionのために必要
-#include <array>      // std::arrayのために必要
 
-// 【重要】ここを修正：標準のTWAI(CAN)ドライバを読み込む
-#include "driver/twai.h" 
+#include <array>       // std::arrayのために必要
+#include <functional>  // std::functionのために必要
+#include <vector>
 
 #include "../interfaces/can_receiver.hpp"
 #include "../interfaces/can_transmitter.hpp"
+#include "driver/twai.h"
 
 namespace can {
 using CanId = uint32_t;
@@ -21,7 +20,8 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
 
   /// @brief セットアップ処理
   /// @param filter_config フィルタ設定（デフォルトは全受信）
-  void setup(twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
+  void setup(
+      twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
 
   /// @brief メッセージ送信
   void transmit(const CanTxMessage message) override;
@@ -32,14 +32,18 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
   /// @brief イベントリスナ登録
   void add_receive_event_listener(
       std::vector<can::CanId> listening_can_ids,
-      std::function<void(const can::CanId, const std::array<uint8_t, 8>)> listener) override;
+      std::function<void(const can::CanId, const std::array<uint8_t, 8>)>
+          listener) override;
 
  private:
-  void restart_driver();
+  void handle_alerts();
 
   twai_general_config_t g_config_;
   twai_timing_config_t t_config_;
   twai_filter_config_t f_config_;
+
+  volatile bool bus_off_ = false;
+  TickType_t restart_tick_ = 0;
 
   /// @brief CAN受信時のイベントリスナのリスト
   std::vector<std::pair<
