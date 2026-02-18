@@ -52,8 +52,7 @@ CanTxMessageBuilder& CanTxMessageBuilder::set_value(const float value,
   const auto scaled_value =
       static_cast<int32_t>(0xFFFFFFFF * normalized_value + min_int32);
   const auto clamped_value =
-      std::clamp(scaled_value, min_int32,
-                 max_int32);  // オーバーフローしない気はするけど一応の対策です
+      std::clamp(scaled_value, min_int32, max_int32);
 
   return this->set_value(clamped_value);
 }

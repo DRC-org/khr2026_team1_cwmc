@@ -2,9 +2,9 @@
 
 #include <Wire.h>
 
-// 利用値の地磁気補正
+// 地磁気偏角 (京田辺別館)
 // https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml#declination
-#define MAG_DECLINATION 8.16f  // 京田辺別館
+#define MAG_DECLINATION 8.16f
 
 namespace lsm9ds1_control {
 Lsm9ds1Controller::Lsm9ds1Controller() : yaw_offset_(0.0f) {}
@@ -32,13 +32,6 @@ float Lsm9ds1Controller::get_yaw() {
 void Lsm9ds1Controller::reset_yaw() { yaw_offset_ = get_raw_yaw(); }
 
 float Lsm9ds1Controller::get_raw_yaw() {
-  // TODO: ↓ 要るか要らないか確認
-  // if (imu.gyroAvailable()) {
-  //   imu.readGyro();
-  // }
-  // if (imu.accelAvailable()) {
-  //   imu.readAccel();
-  // }
   if (imu.magAvailable()) {
     imu.readMag();
   }
