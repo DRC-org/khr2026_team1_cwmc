@@ -43,7 +43,6 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
   twai_filter_config_t f_config_;
 
   volatile bool bus_off_ = false;
-  TickType_t restart_tick_ = 0;
 
   /// @brief CAN受信時のイベントリスナのリスト
   std::vector<std::pair<

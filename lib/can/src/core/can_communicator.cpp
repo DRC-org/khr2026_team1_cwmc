@@ -19,8 +19,9 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   g_config_.tx_queue_len = 10;
   g_config_.rx_queue_len = 50;
 
-  // BUS_OFF と BUS_RECOVERED をアラートで検知
-  g_config_.alerts_enabled = TWAI_ALERT_BUS_OFF;
+  // BUS_OFF / BUS_RECOVERED / ERR_PASS をアラートで検知
+  g_config_.alerts_enabled =
+      TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS;
 
   t_config_ = TWAI_TIMING_CONFIG_1MBITS();
   f_config_ = filter_config;
@@ -40,29 +41,31 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
 }
 
 void CanCommunicator::handle_alerts() {
-  // クールダウン中は送信を抑制し、時間経過後に復帰
-  if (bus_off_) {
-    if (xTaskGetTickCount() - restart_tick_ >= pdMS_TO_TICKS(100)) {
-      bus_off_ = false;
-      Serial.println("TWAI cooldown complete, resuming");
-    }
-    return;
-  }
-
+  // bus_off_ 中でもアラートを読み続け BUS_RECOVERED を検知する
   uint32_t alerts;
   if (twai_read_alerts(&alerts, 0) != ESP_OK) {
     return;
   }
 
+  if (alerts & TWAI_ALERT_ERR_PASS) {
+    // エラーパッシブ状態（TEC/REC > 127）: BUS_OFF 予兆として記録
+    Serial.println("TWAI: Error Passive state");
+  }
+
   if (alerts & TWAI_ALERT_BUS_OFF) {
     bus_off_ = true;
-    Serial.println("TWAI BUS_OFF, restarting driver...");
-    // BUS_OFF 状態では twai_stop() は失敗するので直接 uninstall
-    twai_driver_uninstall();
-    twai_driver_install(&g_config_, &t_config_, &f_config_);
+    Serial.println("TWAI BUS_OFF, リカバリ開始...");
+    // CAN 規定の 128×11 bit リセッシブ列を待つ正規の復帰手順（≒1.4ms）。
+    // uninstall/install は GPIO を再設定してバス上にグリッチを起こすうえ、
+    // 100ms クールダウン中に ACK が返らず他ノードの TEC が蓄積するため使わない。
+    twai_initiate_recovery();
+  }
+
+  if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+    // リカバリ完了後は Stopped 状態になるので twai_start() で再開
     twai_start();
-    restart_tick_ = xTaskGetTickCount();
-    Serial.println("TWAI driver restarted, cooling down...");
+    bus_off_ = false;
+    Serial.println("TWAI: リカバリ完了、再開");
   }
 }
 
