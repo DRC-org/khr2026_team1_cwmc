@@ -7,7 +7,7 @@
 #include <rcl/rcl.h>
 #include <rclc/executor.h>
 #include <rclc/rclc.h>
-#include <std_msgs/msg/string.h>
+#include <robot_msgs/msg/wheel_message.h>
 #include <stdlib.h>
 
 #include <can/core.hpp>
@@ -17,39 +17,13 @@ TaskHandle_t MicroROSTaskHandle = NULL;
 TaskHandle_t ControlTaskHandle = NULL;
 SemaphoreHandle_t DataMutex = NULL;
 
-rcl_publisher_t publisher;
-rcl_subscription_t subscriber;
-rcl_timer_t timer;
-std_msgs__msg__String send_msg;
-std_msgs__msg__String recv_msg;
-
-rclc_executor_t executor;
-rclc_support_t support;
-rcl_allocator_t allocator;
-rcl_node_t node;
-
-can::CanCommunicator* can_comm;
-
-volatile int16_t current_rpm_fl = 0;
-volatile int16_t current_rpm_fr = 0;
-volatile int16_t current_rpm_rl = 0;
-volatile int16_t current_rpm_rr = 0;
-
-volatile int16_t target_rpms[4] = {0, 0, 0, 0};
-
-volatile int32_t output_currents_fb[4] = {0, 0, 0, 0};
-volatile float p_terms_fb[4] = {0, 0, 0, 0};
-volatile float i_terms_fb[4] = {0, 0, 0, 0};
-volatile float d_terms_fb[4] = {0, 0, 0, 0};
-
-// ランタイムで変更可能な PID ゲイン
-volatile float pid_kp = 0.5f;
-volatile float pid_ki = 0.05f;
-volatile float pid_kd = 0.0f;
-#define DT 0.003f  // 制御周期 [秒]
-
-#define CLAMPING_OUTPUT 5000     // 電流クランプ [mA] (M3508: Max 16384 -> 20A)
-#define INTEGRAL_LIMIT 10000.0f  // Anti-windup 積分上限
+// 開発時に WiFi 接続する用
+#if (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
+char ssid[] = "DRC";
+char psk[] = "28228455";
+IPAddress agent_ip(192, 168, 0, 101);
+size_t agent_port = 8888;
+#endif
 
 #define RCCHECK(fn)                \
   {                                \
@@ -68,19 +42,94 @@ volatile float pid_kd = 0.0f;
     }                               \
   }
 
+can::CanCommunicator* can_comm;
+
+// micro-ROS オブジェクト
+rcl_publisher_t pub_feedback;
+rcl_subscription_t sub_control;
+rcl_timer_t timer_feedback;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+
+// メッセージバッファ
+robot_msgs__msg__WheelMessage feedback_msg;
+robot_msgs__msg__WheelMessage control_msg;
+
+// 各ホイールの状態
+struct WheelRPMs {
+  float_t fl;
+  float_t fr;
+  float_t rl;
+  float_t rr;
+};
+
+volatile WheelRPMs target = {0, 0, 0, 0};
+volatile WheelRPMs current = {0, 0, 0, 0};
+
+// 各モータの電流値
+struct MotorCurrents {
+  int32_t fl;
+  int32_t fr;
+  int32_t rl;
+  int32_t rr;
+};
+
+volatile MotorCurrents output_currents = {0, 0, 0, 0};
+
+// PID ゲイン
+struct PIDGains {
+  float kp;
+  float ki;
+  float kd;
+};
+
+volatile PIDGains pid_gains = {0.5f, 0.05f, 0.0f};
+
+// PID Term
+struct PIDTerms {
+  float p;
+  float i;
+  float d;
+};
+
+struct FeedbackPIDTerms {
+  PIDTerms fl;
+  PIDTerms fr;
+  PIDTerms rl;
+  PIDTerms rr;
+};
+
+volatile FeedbackPIDTerms pid_terms;
+
+// volatile int16_t current_rpm_fl = 0;
+// volatile int16_t current_rpm_fr = 0;
+// volatile int16_t current_rpm_rl = 0;
+// volatile int16_t current_rpm_rr = 0;
+
+// volatile int16_t target_rpms[4] = {0, 0, 0, 0};
+
+// volatile int32_t output_currents_fb[4] = {0, 0, 0, 0};
+// volatile float p_terms_fb[4] = {0, 0, 0, 0};
+// volatile float i_terms_fb[4] = {0, 0, 0, 0};
+// volatile float d_terms_fb[4] = {0, 0, 0, 0};
+
+// ランタイムで変更可能な PID ゲイン
+// volatile float pid_kp = 0.5f;
+// volatile float pid_ki = 0.05f;
+// volatile float pid_kd = 0.0f;
+#define DT 0.003f  // 制御周期 [秒]
+
+#define CLAMPING_OUTPUT 5000     // 電流クランプ [mA] (M3508: Max 16384 -> 20A)
+#define INTEGRAL_LIMIT 10000.0f  // Anti-windup 積分上限
+
 void error_loop() {
-  while (1) {
+  while (true) {
     Serial.println("An error occurred in micro-ROS!");
     delay(5000);
   }
 }
-
-#if (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
-char ssid[] = "DRC";
-char psk[] = "28228455";
-IPAddress agent_ip(192, 168, 0, 101);
-size_t agent_port = 8888;
-#endif
 
 void register_can_event_handlers() {
   // M3508 のフィードバック RPM を受け取る
@@ -94,49 +143,46 @@ void register_can_event_handlers() {
         // フィードバックがドロップされるため、ここでは使わない。
         switch (id) {
           case 0x201:
-            current_rpm_fl = rpm;
+            current.fl = rpm;
             break;
           case 0x202:
-            current_rpm_fr = rpm;
+            current.fr = rpm;
             break;
           case 0x203:
-            current_rpm_rl = rpm;
+            current.rl = rpm;
             break;
           case 0x204:
-            current_rpm_rr = rpm;
+            current.rr = rpm;
             break;
         }
       });
 }
 
-void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
+void compute_motor_commands(WheelRPMs target_rpm, int32_t out_current[4]) {
   static float prev_rpm_errors[4] = {0, 0, 0, 0};
   static float integral_errors[4] = {0, 0, 0, 0};
 
-  int16_t current_rpms[4];
+  WheelRPMs local_rpms;
   float local_kp, local_ki, local_kd;
   if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
-    current_rpms[0] = current_rpm_fl;
-    current_rpms[1] = current_rpm_fr;
-    current_rpms[2] = current_rpm_rl;
-    current_rpms[3] = current_rpm_rr;
-    local_kp = pid_kp;
-    local_ki = pid_ki;
-    local_kd = pid_kd;
+    local_rpms.fl = current.fl;
+    local_rpms.fr = current.fr;
+    local_rpms.rl = current.rl;
+    local_rpms.rr = current.rr;
+    local_kp = pid_gains.kp;
+    local_ki = pid_gains.ki;
+    local_kd = pid_gains.kd;
     xSemaphoreGive(DataMutex);
-  } else {
-    // portMAX_DELAY なので基本ここには来ない
-    return;
   }
 
-  float rpm_errors[4];
-  rpm_errors[0] = static_cast<float>(target_rpm[0]) - current_rpms[0];
-  rpm_errors[1] = static_cast<float>(target_rpm[1]) - current_rpms[1];
-  rpm_errors[2] = static_cast<float>(target_rpm[2]) - current_rpms[2];
-  rpm_errors[3] = static_cast<float>(target_rpm[3]) - current_rpms[3];
+  const float target_arr[4] = {target_rpm.fl, target_rpm.fr, target_rpm.rl,
+                               target_rpm.rr};
+  const float current_arr[4] = {local_rpms.fl, local_rpms.fr, local_rpms.rl,
+                                local_rpms.rr};
+  float p_terms_arr[4], i_terms_arr[4], d_terms_arr[4];
 
   for (uint8_t i = 0; i < 4; i++) {
-    float error = rpm_errors[i];
+    float error = target_arr[i] - current_arr[i];
     float d_error = (error - prev_rpm_errors[i]) / DT;
     prev_rpm_errors[i] = error;
 
@@ -146,7 +192,7 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
     float d_term = 0.0f;
 
     // 目標 RPM が 0 のときは積分項をリセットして出力 0
-    if (target_rpm[i] == 0) {
+    if (target_arr[i] == 0) {
       prev_rpm_errors[i] = 0.0f;
       integral_errors[i] = 0.0f;
     } else {
@@ -177,14 +223,29 @@ void compute_motor_commands(int16_t target_rpm[4], int32_t out_current[4]) {
     }
 
     out_current[i] = command_current;
+    p_terms_arr[i] = p_term;
+    i_terms_arr[i] = i_term;
+    d_terms_arr[i] = d_term;
+  }
 
-    if (xSemaphoreTake(DataMutex, 0) == pdTRUE) {
-      output_currents_fb[i] = command_current;
-      p_terms_fb[i] = p_term;
-      i_terms_fb[i] = i_term;
-      d_terms_fb[i] = d_term;
-      xSemaphoreGive(DataMutex);
-    }
+  if (xSemaphoreTake(DataMutex, 0) == pdTRUE) {
+    output_currents.fl = out_current[0];
+    output_currents.fr = out_current[1];
+    output_currents.rl = out_current[2];
+    output_currents.rr = out_current[3];
+    pid_terms.fl.p = p_terms_arr[0];
+    pid_terms.fl.i = i_terms_arr[0];
+    pid_terms.fl.d = d_terms_arr[0];
+    pid_terms.fr.p = p_terms_arr[1];
+    pid_terms.fr.i = i_terms_arr[1];
+    pid_terms.fr.d = d_terms_arr[1];
+    pid_terms.rl.p = p_terms_arr[2];
+    pid_terms.rl.i = i_terms_arr[2];
+    pid_terms.rl.d = d_terms_arr[2];
+    pid_terms.rr.p = p_terms_arr[3];
+    pid_terms.rr.i = i_terms_arr[3];
+    pid_terms.rr.d = d_terms_arr[3];
+    xSemaphoreGive(DataMutex);
   }
 }
 
@@ -200,105 +261,61 @@ void milli_amperes_to_bytes(const int32_t milli_amperes[4],
   }
 }
 
-// rspi からの JSON コマンドを受信
-IRAM_ATTR void subscription_callback(const void* msgin) {
-  const std_msgs__msg__String* msg = (const std_msgs__msg__String*)msgin;
+// wheel_control topic の callback
+IRAM_ATTR void on_control_command(const void* msg_in) {
+  const auto* cmd = static_cast<const robot_msgs__msg__WheelMessage*>(msg_in);
 
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, msg->data.data);
+  if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+    target.fl = cmd->m3508_rpms.fl;
+    target.fr = cmd->m3508_rpms.fr;
+    target.rl = cmd->m3508_rpms.rl;
+    target.rr = cmd->m3508_rpms.rr;
 
-  if (error) {
-    Serial.print("JSON parse error: ");
-    Serial.println(error.c_str());
-    return;
-  }
-
-  if (doc.containsKey("m3508_rpms")) {
-    float fl_rpm = doc["m3508_rpms"]["fl"] | 0.0;
-    float fr_rpm = doc["m3508_rpms"]["fr"] | 0.0;
-    float rl_rpm = doc["m3508_rpms"]["rl"] | 0.0;
-    float rr_rpm = doc["m3508_rpms"]["rr"] | 0.0;
-
-    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
-      target_rpms[0] = static_cast<int16_t>(fl_rpm);
-      target_rpms[1] = static_cast<int16_t>(fr_rpm);
-      target_rpms[2] = static_cast<int16_t>(rl_rpm);
-      target_rpms[3] = static_cast<int16_t>(rr_rpm);
-      xSemaphoreGive(DataMutex);
-    }
-  }
-
-  if (doc.containsKey("pid_gains")) {
-    float new_kp = doc["pid_gains"]["kp"] | pid_kp;
-    float new_ki = doc["pid_gains"]["ki"] | pid_ki;
-    float new_kd = doc["pid_gains"]["kd"] | pid_kd;
-
-    new_kp = constrain(new_kp, 0.0f, 10.0f);
-    new_ki = constrain(new_ki, 0.0f, 1.0f);
-    new_kd = constrain(new_kd, 0.0f, 1.0f);
-
-    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
-      pid_kp = new_kp;
-      pid_ki = new_ki;
-      pid_kd = new_kd;
-      xSemaphoreGive(DataMutex);
+    if (cmd->m3508_gains.size > 0) {
+      pid_gains.kp = cmd->m3508_gains.data[0].kp;
+      pid_gains.ki = cmd->m3508_gains.data[0].ki;
+      pid_gains.kd = cmd->m3508_gains.data[0].kd;
     }
 
-    Serial.print("PID gains updated: Kp=");
-    Serial.print(pid_kp);
-    Serial.print(", Ki=");
-    Serial.print(pid_ki);
-    Serial.print(", Kd=");
-    Serial.println(pid_kd);
+    xSemaphoreGive(DataMutex);
   }
 }
 
-// rspi にフィードバック値を送信 (50Hz)
-void timer_callback(rcl_timer_t* timer, int64_t last_call_time) {
-  StaticJsonDocument<768> doc;
+// 50 ms ごとにフィードバックを送信する
+IRAM_ATTR void timer_feedback_callback(rcl_timer_t* timer,
+                                       int64_t /*last_call_time*/) {
+  if (timer == nullptr) return;
 
   if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
-    doc["m3508_rpms"]["fl"] = current_rpm_fl;
-    doc["m3508_rpms"]["fr"] = current_rpm_fr;
-    doc["m3508_rpms"]["rl"] = current_rpm_rl;
-    doc["m3508_rpms"]["rr"] = current_rpm_rr;
+    feedback_msg.m3508_rpms.fl = current.fl;
+    feedback_msg.m3508_rpms.fr = current.fr;
+    feedback_msg.m3508_rpms.rl = current.rl;
+    feedback_msg.m3508_rpms.rr = current.rr;
 
-    doc["target_rpms"]["fl"] = target_rpms[0];
-    doc["target_rpms"]["fr"] = target_rpms[1];
-    doc["target_rpms"]["rl"] = target_rpms[2];
-    doc["target_rpms"]["rr"] = target_rpms[3];
+    feedback_msg.m3508_gains.data[0].kp = pid_gains.kp;
+    feedback_msg.m3508_gains.data[0].ki = pid_gains.ki;
+    feedback_msg.m3508_gains.data[0].kd = pid_gains.kd;
 
-    doc["output_currents"]["fl"] = output_currents_fb[0];
-    doc["output_currents"]["fr"] = output_currents_fb[1];
-    doc["output_currents"]["rl"] = output_currents_fb[2];
-    doc["output_currents"]["rr"] = output_currents_fb[3];
-
-    doc["p_terms"]["fl"] = p_terms_fb[0];
-    doc["p_terms"]["fr"] = p_terms_fb[1];
-    doc["p_terms"]["rl"] = p_terms_fb[2];
-    doc["p_terms"]["rr"] = p_terms_fb[3];
-
-    doc["i_terms"]["fl"] = i_terms_fb[0];
-    doc["i_terms"]["fr"] = i_terms_fb[1];
-    doc["i_terms"]["rl"] = i_terms_fb[2];
-    doc["i_terms"]["rr"] = i_terms_fb[3];
-
-    doc["d_terms"]["fl"] = d_terms_fb[0];
-    doc["d_terms"]["fr"] = d_terms_fb[1];
-    doc["d_terms"]["rl"] = d_terms_fb[2];
-    doc["d_terms"]["rr"] = d_terms_fb[3];
-
-    doc["pid_gains"]["kp"] = pid_kp;
-    doc["pid_gains"]["ki"] = pid_ki;
-    doc["pid_gains"]["kd"] = pid_kd;
+    feedback_msg.m3508_terms.data[0].fl.p = pid_terms.fl.p;
+    feedback_msg.m3508_terms.data[0].fl.i = pid_terms.fl.i;
+    feedback_msg.m3508_terms.data[0].fl.d = pid_terms.fl.d;
+    feedback_msg.m3508_terms.data[0].fr.p = pid_terms.fr.p;
+    feedback_msg.m3508_terms.data[0].fr.i = pid_terms.fr.i;
+    feedback_msg.m3508_terms.data[0].fr.d = pid_terms.fr.d;
+    feedback_msg.m3508_terms.data[0].rl.p = pid_terms.rl.p;
+    feedback_msg.m3508_terms.data[0].rl.i = pid_terms.rl.i;
+    feedback_msg.m3508_terms.data[0].rl.d = pid_terms.rl.d;
+    feedback_msg.m3508_terms.data[0].rr.p = pid_terms.rr.p;
+    feedback_msg.m3508_terms.data[0].rr.i = pid_terms.rr.i;
+    feedback_msg.m3508_terms.data[0].rr.d = pid_terms.rr.d;
 
     xSemaphoreGive(DataMutex);
   }
 
-  size_t n = serializeJson(doc, send_msg.data.data, send_msg.data.capacity);
-  send_msg.data.size = n;
+  feedback_msg.m3508_gains.size = 1;
+  feedback_msg.m3508_terms.size = 1;
 
-  RCSOFTCHECK(rcl_publish(&publisher, &send_msg, NULL));
+  RCSOFTCHECK(rcl_publish(&pub_feedback, &feedback_msg, NULL));
 }
 
 void setup_micro_ros() {
@@ -309,106 +326,89 @@ void setup_micro_ros() {
 #endif
 
   allocator = rcl_get_default_allocator();
-
-  Serial.println("Init support...");
   RCCHECK(rclc_support_init(&support, 0, nullptr, &allocator));
-
-  Serial.println("Init node...");
   RCCHECK(rclc_node_init_default(&node, "cwmc_node", "", &support));
 
-  Serial.println("Init publisher...");
+  // Publisher: wheel_feedback (WheelMessage 型)
   RCCHECK(rclc_publisher_init_default(
-      &publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-      "robot_feedback"));
+      &pub_feedback, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
+      "wheel_feedback"));
 
-  Serial.println("Init subscription...");
+  // Subscriber: wheel_control (WheelMessage 型)
   RCCHECK(rclc_subscription_init_default(
-      &subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-      "robot_control"));
+      &sub_control, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
+      "wheel_control"));
 
-  const unsigned int timer_timeout = 20;  // 50Hz
-  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(timer_timeout),
-                                  timer_callback));
+  // Timer: 50 ms ごとにフィードバック送信
+  RCCHECK(rclc_timer_init_default(&timer_feedback, &support, RCL_MS_TO_NS(50),
+                                  timer_feedback_callback));
 
-  std_msgs__msg__String__init(&recv_msg);
-  std_msgs__msg__String__init(&send_msg);
+  // Message の初期化
+  robot_msgs__msg__WheelMessage__init(&control_msg);
+  robot_msgs__msg__WheelMessage__init(&feedback_msg);
 
-  const size_t kRecvBufferSize = 256;
-  const size_t kSendBufferSize = 1024;
-  recv_msg.data.data = (char*)malloc(kRecvBufferSize * sizeof(char));
-  recv_msg.data.size = 0;
-  recv_msg.data.capacity = kRecvBufferSize;
-
-  send_msg.data.data = (char*)malloc(kSendBufferSize * sizeof(char));
-  send_msg.data.size = 0;
-  send_msg.data.capacity = kSendBufferSize;
-
-  Serial.println("Init executor...");
-  executor = rclc_executor_get_zero_initialized_executor();
+  // Executor: Sub 1 + Timer 1
   RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-
-  Serial.println("Add timer to executor...");
-  RCCHECK(rclc_executor_add_timer(&executor, &timer));
-
-  Serial.println("Add subscription to executor...");
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &recv_msg,
-                                         &subscription_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_control, &control_msg,
+                                         &on_control_command, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &timer_feedback));
 }
 
-// --------------------------------------------------------------------------------
-// Tasks
-// --------------------------------------------------------------------------------
-
 // Control Task: Core 1, 最高優先度
-// CAN 受信処理と PID 制御ループを担当
 void ControlTask(void* pvParameters) {
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(3);
   xLastWakeTime = xTaskGetTickCount();
 
   while (1) {
-    // 1. CAN 受信処理（キューを全て消化）
+    // CAN 受信処理（キューを 1 つずつ処理）
     can_comm->process_received_messages();
 
-    // 2. 制御計算
+    // 制御計算
     int32_t output_currents[4] = {0, 0, 0, 0};
-    int16_t current_target_rpms[4];
+    WheelRPMs local_current_rpms;
+    WheelRPMs local_target_rpms;
 
-    if (xSemaphoreTake(DataMutex, 0) == pdTRUE) {
-      current_target_rpms[0] = target_rpms[0];
-      current_target_rpms[1] = target_rpms[1];
-      current_target_rpms[2] = target_rpms[2];
-      current_target_rpms[3] = target_rpms[3];
+    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+      local_current_rpms.fl = current.fl;
+      local_current_rpms.fr = current.fr;
+      local_current_rpms.rl = current.rl;
+      local_current_rpms.rr = current.rr;
+
+      local_target_rpms.fl = target.fl;
+      local_target_rpms.fr = target.fr;
+      local_target_rpms.rl = target.rl;
+      local_target_rpms.rr = target.rr;
+
       xSemaphoreGive(DataMutex);
-    } else {
-      // ロック取得失敗時は安全のため 0 初期化
-      memset(current_target_rpms, 0, sizeof(current_target_rpms));
     }
 
-    compute_motor_commands(current_target_rpms, output_currents);
+    compute_motor_commands(local_target_rpms, output_currents);
 
     // デバッグ出力（約1秒間隔）
     static int debug_count = 0;
     if (debug_count++ > 300) {
       debug_count = 0;
       Serial.print("Target RPM: [");
-      Serial.print(current_target_rpms[0]);
+      Serial.print(local_target_rpms.fl);
       Serial.print(", ");
-      Serial.print(current_target_rpms[1]);
+      Serial.print(local_target_rpms.fr);
       Serial.print(", ");
-      Serial.print(current_target_rpms[2]);
+      Serial.print(local_target_rpms.rl);
       Serial.print(", ");
-      Serial.print(current_target_rpms[3]);
+      Serial.print(local_target_rpms.rr);
       Serial.println("]");
 
       Serial.print("Current RPM: [");
-      Serial.print(current_rpm_fl);
+      Serial.print(local_current_rpms.fl);
       Serial.print(", ");
-      Serial.print(current_rpm_fr);
+      Serial.print(local_current_rpms.fr);
       Serial.print(", ");
-      Serial.print(current_rpm_rl);
+      Serial.print(local_current_rpms.rl);
       Serial.print(", ");
-      Serial.print(current_rpm_rr);
+      Serial.print(local_current_rpms.rr);
       Serial.println("]");
 
       Serial.print("Out Current: [");
@@ -422,7 +422,7 @@ void ControlTask(void* pvParameters) {
       Serial.println("]");
     }
 
-    // 3. CAN 送信
+    // CAN 送信
     uint8_t tx_buf[8];
     milli_amperes_to_bytes(output_currents, tx_buf);
     can_comm->transmit(
@@ -434,7 +434,6 @@ void ControlTask(void* pvParameters) {
 }
 
 // Micro-ROS Task: Core 0, 標準優先度
-// Wi-Fi 通信と JSON パースを担当
 void MicroROSTask(void* pvParameters) {
   setup_micro_ros();
 
