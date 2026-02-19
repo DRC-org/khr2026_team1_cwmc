@@ -7,6 +7,8 @@
 #include <rcl/rcl.h>
 #include <rclc/executor.h>
 #include <rclc/rclc.h>
+#include <robot_msgs/msg/detail/feedback_pid_terms__functions.h>
+#include <robot_msgs/msg/detail/pid_gains__functions.h>
 #include <robot_msgs/msg/wheel_message.h>
 #include <stdlib.h>
 
@@ -25,21 +27,12 @@ IPAddress agent_ip(192, 168, 0, 101);
 size_t agent_port = 8888;
 #endif
 
-#define RCCHECK(fn)                \
+#define RCSOFTCHECK(fn)            \
   {                                \
     rcl_ret_t temp_rc = fn;        \
     if ((temp_rc != RCL_RET_OK)) { \
-      error_loop();                \
+      (void)temp_rc;               \
     }                              \
-  }
-
-#define RCSOFTCHECK(fn)             \
-  {                                 \
-    rcl_ret_t temp_rc = fn;         \
-    if ((temp_rc != RCL_RET_OK)) {  \
-      Serial.print("Soft error: "); \
-      Serial.println(temp_rc);      \
-    }                               \
   }
 
 can::CanCommunicator* can_comm;
@@ -124,12 +117,7 @@ volatile FeedbackPIDTerms pid_terms;
 #define CLAMPING_OUTPUT 5000     // 電流クランプ [mA] (M3508: Max 16384 -> 20A)
 #define INTEGRAL_LIMIT 10000.0f  // Anti-windup 積分上限
 
-void error_loop() {
-  while (true) {
-    Serial.println("An error occurred in micro-ROS!");
-    delay(5000);
-  }
-}
+enum class AgentState { WAITING, CONNECTED, DISCONNECTED };
 
 void register_can_event_handlers() {
   // M3508 のフィードバック RPM を受け取る
@@ -318,42 +306,67 @@ IRAM_ATTR void timer_feedback_callback(rcl_timer_t* timer,
   RCSOFTCHECK(rcl_publish(&pub_feedback, &feedback_msg, NULL));
 }
 
-void setup_micro_ros() {
-#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL == 1)
-  set_microros_serial_transports(Serial);
-#elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
-  set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
-#endif
-
+static bool create_entities() {
   allocator = rcl_get_default_allocator();
-  RCCHECK(rclc_support_init(&support, 0, nullptr, &allocator));
-  RCCHECK(rclc_node_init_default(&node, "cwmc_node", "", &support));
+  if (rclc_support_init(&support, 0, nullptr, &allocator) != RCL_RET_OK)
+    return false;
+  if (rclc_node_init_default(&node, "cwmc_node", "", &support) != RCL_RET_OK)
+    return false;
 
-  // Publisher: wheel_feedback (WheelMessage 型)
-  RCCHECK(rclc_publisher_init_default(
-      &pub_feedback, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
-      "wheel_feedback"));
+  if (rclc_publisher_init_default(
+          &pub_feedback, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
+          "wheel_feedback") != RCL_RET_OK)
+    return false;
 
-  // Subscriber: wheel_control (WheelMessage 型)
-  RCCHECK(rclc_subscription_init_default(
-      &sub_control, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
-      "wheel_control"));
+  if (rclc_subscription_init_default(
+          &sub_control, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(robot_msgs, msg, WheelMessage),
+          "wheel_control") != RCL_RET_OK)
+    return false;
 
-  // Timer: 50 ms ごとにフィードバック送信
-  RCCHECK(rclc_timer_init_default(&timer_feedback, &support, RCL_MS_TO_NS(50),
-                                  timer_feedback_callback));
+  if (rclc_timer_init_default(&timer_feedback, &support, RCL_MS_TO_NS(50),
+                              timer_feedback_callback) != RCL_RET_OK)
+    return false;
 
-  // Message の初期化
   robot_msgs__msg__WheelMessage__init(&control_msg);
   robot_msgs__msg__WheelMessage__init(&feedback_msg);
 
-  // Executor: Sub 1 + Timer 1
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &sub_control, &control_msg,
-                                         &on_control_command, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer_feedback));
+  // __init は Sequence の data を NULL・容量 0 で初期化するため、
+  // data[0] アクセス前に容量 1 で明示的にアロケートする
+  robot_msgs__msg__PIDGains__Sequence__init(&control_msg.m3508_gains, 1);
+  robot_msgs__msg__PIDGains__Sequence__init(&feedback_msg.m3508_gains, 1);
+  robot_msgs__msg__FeedbackPIDTerms__Sequence__init(&control_msg.m3508_terms,
+                                                    1);
+  robot_msgs__msg__FeedbackPIDTerms__Sequence__init(&feedback_msg.m3508_terms,
+                                                    1);
+
+  if (rclc_executor_init(&executor, &support.context, 2, &allocator) !=
+      RCL_RET_OK)
+    return false;
+  if (rclc_executor_add_subscription(&executor, &sub_control, &control_msg,
+                                     &on_control_command,
+                                     ON_NEW_DATA) != RCL_RET_OK)
+    return false;
+  if (rclc_executor_add_timer(&executor, &timer_feedback) != RCL_RET_OK)
+    return false;
+
+  return true;
+}
+
+static void destroy_entities() {
+  rmw_context_t* rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rclc_executor_fini(&executor);
+  rcl_timer_fini(&timer_feedback);
+  rcl_subscription_fini(&sub_control, &node);
+  rcl_publisher_fini(&pub_feedback, &node);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+
+  robot_msgs__msg__WheelMessage__fini(&control_msg);
+  robot_msgs__msg__WheelMessage__fini(&feedback_msg);
 }
 
 // Control Task: Core 1, 最高優先度
@@ -387,7 +400,9 @@ void ControlTask(void* pvParameters) {
 
     compute_motor_commands(local_target_rpms, output_currents);
 
-    // デバッグ出力（約1秒間隔）
+// Serial transport 使用時は Serial がバイナリプロトコルに占有されるため、
+// デバッグ出力を有効にするとフレームが壊れて切断の原因になる
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     static int debug_count = 0;
     if (debug_count++ > 300) {
       debug_count = 0;
@@ -421,6 +436,7 @@ void ControlTask(void* pvParameters) {
       Serial.print(output_currents[3]);
       Serial.println("]");
     }
+#endif
 
     // CAN 送信
     uint8_t tx_buf[8];
@@ -435,25 +451,78 @@ void ControlTask(void* pvParameters) {
 
 // Micro-ROS Task: Core 0, 標準優先度
 void MicroROSTask(void* pvParameters) {
-  setup_micro_ros();
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL == 1)
+  set_microros_serial_transports(Serial);
+#elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
+  set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
+#endif
+
+  AgentState agent_state = AgentState::WAITING;
+  uint32_t ping_counter = 0;
 
   while (1) {
-    // タイムアウト 10ms でタスク切り替えの余地を与える
-    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
-    vTaskDelay(10);
+    switch (agent_state) {
+      case AgentState::WAITING:
+        if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
+          if (create_entities()) {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
+            Serial.println("micro-ROS: connected");
+#endif
+            ping_counter = 0;
+            agent_state = AgentState::CONNECTED;
+          } else {
+            destroy_entities();
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        break;
+
+      case AgentState::CONNECTED:
+        // 約 1 秒ごとに agent の死活確認
+        if (++ping_counter >= 100) {
+          ping_counter = 0;
+          if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
+            Serial.println("micro-ROS: agent disconnected");
+#endif
+            agent_state = AgentState::DISCONNECTED;
+            break;
+          }
+        }
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+        vTaskDelay(pdMS_TO_TICKS(10));
+        break;
+
+      case AgentState::DISCONNECTED:
+        // 切断時にモーターを安全停止
+        if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+          target.fl = 0;
+          target.fr = 0;
+          target.rl = 0;
+          target.rr = 0;
+          xSemaphoreGive(DataMutex);
+        }
+        destroy_entities();
+        agent_state = AgentState::WAITING;
+        break;
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
   Serial.println("setup start");
+#endif
 
   DataMutex = xSemaphoreCreateMutex();
 
   // CAN 通信の初期化（フィルタなし = 全受信）
   can_comm = new can::CanCommunicator();
   can_comm->setup();
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
   Serial.println("CAN setup complete");
+#endif
 
   register_can_event_handlers();
 
@@ -466,7 +535,9 @@ void setup() {
   xTaskCreatePinnedToCore(MicroROSTask, "MicroROSTask", 8192, NULL, 2,
                           &MicroROSTaskHandle, 0);
 
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
   Serial.println("Tasks started");
+#endif
 }
 
 void loop() { vTaskDelay(portMAX_DELAY); }
