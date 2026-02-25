@@ -386,8 +386,8 @@ void ControlTask(void* pvParameters) {
 
   while (1) {
     // CAN 受信処理（キューを 1 つずつ処理）
-    // can_comm->process_received_messages();
-    can_comm->receive();
+    can_comm->process_received_messages();
+    // can_comm->receive();
 
     // フィードバックタイムアウト: C620 が bus-off
     // 等でフィードバックを停止した場合、 current が古い値のまま残り PID
@@ -428,7 +428,8 @@ void ControlTask(void* pvParameters) {
     {
       static bool feedback_lost[4] = {false, false, false, false};
       const uint32_t now = millis();
-      const char* motor_names[4] = {"fl(0x201)", "fr(0x202)", "rl(0x203)", "rr(0x204)"};
+      const char* motor_names[4] = {"fl(0x201)", "fr(0x202)", "rl(0x203)",
+                                    "rr(0x204)"};
       for (int i = 0; i < 4; i++) {
         bool is_lost = (now - last_feedback_ms[i] > 1000);
         if (is_lost && !feedback_lost[i]) {

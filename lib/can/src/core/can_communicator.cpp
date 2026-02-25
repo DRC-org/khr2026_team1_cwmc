@@ -1,140 +1,154 @@
 #include "can_communicator.hpp"
 
-#define CAN_DEBUG
+#include <Arduino.h>
+
+// 【重要】お使いのボードに合わせてピン番号を変更してください
+// 一般的なESP32でのCANピン設定例 (GPIO 5, 4)
+#ifndef CAN_TX
+#define CAN_TX GPIO_NUM_16
+#endif
+#ifndef CAN_RX
+#define CAN_RX GPIO_NUM_4
+#endif
 
 namespace can {
-/// @brief デバッグ出力の間隔(ループ回数)
-constexpr uint8_t DEBUG_PRINT_INTERVAL = 1;
 
-constexpr gpio_num_t CAN_TX = GPIO_NUM_16;
-constexpr gpio_num_t CAN_RX = GPIO_NUM_4;
-
-CanCommunicator::CanCommunicator() : receive_event_listeners() {}
+CanCommunicator::CanCommunicator() {}
 
 void CanCommunicator::setup(twai_filter_config_t filter_config) {
-  twai_general_config_t general_config =
-      TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL);
-  general_config.tx_queue_len = 0;
-  // 4モーター × フィードバック頻度 × 制御周期 3ms
-  // 分のバーストを収容できるサイズ
-  general_config.rx_queue_len = 20;
-  twai_timing_config_t timing_config = TWAI_TIMING_CONFIG_1MBITS();
+  // 1. 一般設定 (TXピン, RXピン, モード設定)
+  // バスオフ状態からの自動復帰を有効にするため TWAI_ALERT_BUS_RECOVERED
+  // を監視するか、 あるいは単純にドライバの自動復帰機能を信頼して運用します。
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+      (gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
+  g_config.tx_queue_len = 50;
+  g_config.rx_queue_len = 50;
+  // エラー時に自動でバスオフから復帰するように設定（重要）
+  // これを設定しないと、エラーが蓄積してバスオフになった際、手動でリセットしない限り復帰できません
+  // ただし、ESP-IDFのバージョンによっては構造体のメンバ名が異なる場合があるため注意が必要ですが、
+  // Arduino-ESP32 では通常デフォルトで自動復帰は無効です。
+  // ここではドライバ再起動を試みるロジックを別途入れるか、またはアラートを監視するのが定石です。
 
-  const auto driver_install_result =
-      twai_driver_install(&general_config, &timing_config, &filter_config);
-  if (driver_install_result == ESP_OK) {
-    Serial.println("Driver install OK!");
-  } else {
-    Serial.println("Driver install fail!");
+  // 2. タイミング設定 (1Mbit/s)
+  // 通信相手のビットレートと必ず合わせる必要があります
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+
+  // 3. フィルタ設定 (引数から受け取る)
+  twai_filter_config_t f_config = filter_config;
+
+  // ドライバのインストール
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+    Serial.println("Failed to install TWAI driver");
     return;
   }
+  Serial.println("TWAI Driver installed");
 
-  const auto start_result = twai_start();
-  if (start_result == ESP_OK) {
-    Serial.println("Driver start OK!");
-  } else {
-    Serial.println("Driver start fail!");
+  // ドライバの開始
+  if (twai_start() != ESP_OK) {
+    Serial.println("Failed to start TWAI driver");
     return;
   }
-}
-
-void CanCommunicator::check_errors() const {
-  twai_status_info_t status;
-  if (twai_get_status_info(&status) != ESP_OK) return;
-
-  if (status.state == TWAI_STATE_BUS_OFF) {
-    // twai_initiate_recovery() は ss=1 + CONFIG_TWAI_ERRATA_FIX_TX_INTR_LOST と
-    // 組み合わせると assert クラッシュを引き起こす。
-    // twai_stop() は BUS_OFF 状態でも呼び出し可能。
-    // stop → start はハードウェアリセット経由のため TEC と REC が両方 0 にリセットされる。
-    twai_stop();
-    twai_start();
-#ifdef CAN_DEBUG
-    Serial.println("CAN: bus-off recovered");
-#endif
-  } else if (status.state == TWAI_STATE_STOPPED) {
-    twai_start();
-#ifdef CAN_DEBUG
-    Serial.println("CAN: restarted from STOPPED");
-#endif
-  }
-  // TEC>96 によるプリエンプティブ再起動を廃止。
-  // twai_stop() 呼び出しが C620 フレームの受信を中断し ESP32 の REC を蓄積させ、
-  // エラーパッシブ状態に陥って C620 フィードバックが無音で破棄される根本原因だった。
-  // ss=1 + ERRATA_FIX_TX_INTR_LOST の TX 割り込み消失 (Transmit Fail: -1) も同原因。
+  Serial.println("TWAI Driver started");
 }
 
 void CanCommunicator::transmit(const CanTxMessage message) const {
-  static uint32_t count = 0;
-  count++;
+  // flags の reserved/dlc_non_comp ビットにゴミが混入しないようゼロ初期化
+  twai_message_t tx_msg = {};
+  tx_msg.identifier = message.id;
+  tx_msg.extd = 0;
+  tx_msg.rtr = 0;
+  tx_msg.ss = 0;
+  tx_msg.self = 0;
+  tx_msg.data_length_code = 8;
 
-  twai_message_t tx_message;
-  tx_message.identifier = message.id;
-  tx_message.extd = 0;
-  tx_message.rtr = 0;
-  tx_message.ss = 1;
-  tx_message.self = 0;
-  tx_message.dlc_non_comp = 0;
-  tx_message.data_length_code = 8;
-  for (uint8_t i = 0; i < 8; i++) {
-    tx_message.data[i] = message.data[i];
+  for (int i = 0; i < 8; i++) {
+    tx_msg.data[i] = message.data[i];
   }
 
-  const auto tx_result = twai_transmit(&tx_message, 0);
-
-  if (tx_result == ESP_ERR_INVALID_STATE) {
-    check_errors();
+  // ControlTask の 3ms 周期を守るためノンブロッキング送信
+  if (twai_transmit(&tx_msg, 0) == ESP_OK) {
     return;
   }
 
-#ifdef CAN_DEBUG
-  if (count % DEBUG_PRINT_INTERVAL == 0 && tx_result != ESP_OK) {
-    Serial.print("Transmit Fail: ");
-    Serial.println(tx_result);
+  twai_status_info_t status_info = {};
+  twai_get_status_info(&status_info);
+  uint32_t alerts = 0;
+  twai_read_alerts(&alerts, 0);
+
+  // ログスパム防止: 1 秒に 1 回まで
+  static uint32_t last_error_ms = 0;
+  const uint32_t now = millis();
+  if (now - last_error_ms >= 1000) {
+    last_error_ms = now;
+    Serial.print("Failed to queue message. State: ");
+    Serial.print(status_info.state);
+    Serial.print(", TED: ");
+    Serial.print(status_info.tx_error_counter);
+    Serial.print(", RED: ");
+    Serial.print(status_info.rx_error_counter);
+    Serial.print(", Alerts: ");
+    Serial.println(alerts, HEX);
   }
-#endif
+
+  switch (status_info.state) {
+    case TWAI_STATE_BUS_OFF:
+      twai_initiate_recovery();
+      break;
+    case TWAI_STATE_STOPPED:
+      // 何らかの理由でドライバが停止していた場合に再起動する
+      twai_start();
+      break;
+    case TWAI_STATE_RECOVERING:
+      // 復旧シーケンス中は完了を待つだけ
+      break;
+    default:
+      break;
+  }
 }
 
-void CanCommunicator::receive() const {
-  static uint32_t count = 0;
-  count++;
+void CanCommunicator::process_received_messages() {
+  twai_message_t rx_msg;
 
-  if (count % 10 == 0) {
-    check_errors();
-  }
+  // 受信キューにメッセージがあるか確認 (待機時間0でポーリング)
+  while (twai_receive(&rx_msg, 0) == ESP_OK) {
+    // データフレームのみ処理 (RTRフレームは無視)
+    if (!rx_msg.rtr) {
+      // std::array に変換
+      std::array<uint8_t, 8> data_array;
+      for (int i = 0; i < 8; i++) {
+        data_array[i] = rx_msg.data[i];
+      }
 
-  // キュー内の全メッセージを処理する。
-  // 1 呼び出しで 1 メッセージしか処理しないと、4 モーターからのフィードバックが
-  // キューに溜まりオーバーフローで破棄され、current_rpm が更新されなくなる。
-  while (true) {
-    twai_message_t rx_message;
-    const auto rx_result = twai_receive(&rx_message, 0);
+      // 【デバッグ用】全受信メッセージをログ出力
+      // Serial.print("CAN RX ID: 0x");
+      // Serial.print(rx_msg.identifier, HEX);
+      // Serial.print(" Data: ");
+      // for(int i=0; i<8; i++) {
+      //     Serial.print(data_array[i], HEX);
+      //     Serial.print(" ");
+      // }
+      // Serial.println();
 
-    if (rx_result == ESP_ERR_INVALID_STATE) {
-      check_errors();
-      break;
-    }
+      // 登録されたリスナーに通知
+      for (const auto& listener_pair : receive_event_listeners) {
+        const auto& target_ids = listener_pair.first;
+        const auto& callback = listener_pair.second;
 
-    // ESP_ERR_TIMEOUT はキューが空の正常状態
-    if (rx_result != ESP_OK) {
-      break;
-    }
+        // ターゲットIDリストが空なら「すべて受信」、指定があれば一致確認
+        bool match = target_ids.empty();
+        if (!match) {
+          for (const auto& id : target_ids) {
+            if (id == rx_msg.identifier) {
+              match = true;
+              break;
+            }
+          }
+        }
 
-    if (rx_message.rtr || rx_message.extd) {
-      continue;
-    }
-
-    const auto rx_id = rx_message.identifier;
-    std::array<uint8_t, 8> rx_buf = {};
-    for (uint8_t i = 0; i < 8; i++) {
-      rx_buf[i] = rx_message.data[i];
-    }
-
-    for (const auto& listener : receive_event_listeners) {
-      if (std::any_of(
-              listener.first.begin(), listener.first.end(),
-              [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
-        listener.second(rx_id, rx_buf);
+        // マッチしたらコールバック実行
+        if (match && callback) {
+          callback(rx_msg.identifier, data_array);
+        }
       }
     }
   }
@@ -144,7 +158,8 @@ void CanCommunicator::add_receive_event_listener(
     std::vector<can::CanId> listening_can_ids,
     std::function<void(const can::CanId, const std::array<uint8_t, 8>)>
         listener) {
-  receive_event_listeners.push_back(
-      std::make_pair(listening_can_ids, listener));
+  // リスナーリストに追加
+  receive_event_listeners.push_back({listening_can_ids, listener});
 }
+
 }  // namespace can
