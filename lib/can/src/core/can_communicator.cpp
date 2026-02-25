@@ -1,130 +1,134 @@
 #include "can_communicator.hpp"
 
-#include <Arduino.h>
-
-#ifndef CAN_TX
-#define CAN_TX GPIO_NUM_16
-#endif
-#ifndef CAN_RX
-#define CAN_RX GPIO_NUM_4
-#endif
+#define CAN_DEBUG
 
 namespace can {
+/// @brief デバッグ出力の間隔(ループ回数)
+constexpr uint8_t DEBUG_PRINT_INTERVAL = 1;
 
-CanCommunicator::CanCommunicator() {}
+constexpr gpio_num_t CAN_TX = GPIO_NUM_16;
+constexpr gpio_num_t CAN_RX = GPIO_NUM_4;
+
+CanCommunicator::CanCommunicator() : receive_event_listeners() {}
 
 void CanCommunicator::setup(twai_filter_config_t filter_config) {
-  g_config_ = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX,
-                                          (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
-  g_config_.tx_queue_len = 10;
-  g_config_.rx_queue_len = 50;
+  twai_general_config_t general_config =
+      // NO_ACK モード: ACK ビットを要求しないため ACK エラーが発生せず TEC が上昇しない。
+      // これによりモーター側の瞬断でもバスオフを防げる。受信は正常に動作する。
+      TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NO_ACK);
+  general_config.tx_queue_len = 0;
+  twai_timing_config_t timing_config = TWAI_TIMING_CONFIG_1MBITS();
 
-  // BUS_OFF / BUS_RECOVERED / ERR_PASS をアラートで検知
-  g_config_.alerts_enabled =
-      TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS;
-
-  t_config_ = TWAI_TIMING_CONFIG_1MBITS();
-  f_config_ = filter_config;
-
-  if (twai_driver_install(&g_config_, &t_config_, &f_config_) == ESP_OK) {
-    Serial.println("TWAI Driver installed");
+  const auto driver_install_result = twai_driver_install_v2(
+      &general_config, &timing_config, &filter_config, &twai_handle);
+  if (driver_install_result == ESP_OK) {
+    Serial.println("Driver install OK!");
   } else {
-    Serial.println("Failed to install TWAI driver");
+    Serial.println("Driver install fail!");
     return;
   }
 
-  if (twai_start() == ESP_OK) {
-    Serial.println("TWAI Driver started");
+  const auto start_result = twai_start_v2(twai_handle);
+  if (start_result == ESP_OK) {
+    Serial.println("Driver start OK!");
   } else {
-    Serial.println("Failed to start TWAI driver");
+    Serial.println("Driver start fail!");
+    return;
   }
 }
 
-void CanCommunicator::handle_alerts() {
-  // bus_off_ 中でもアラートを読み続け BUS_RECOVERED を検知する
-  uint32_t alerts;
-  if (twai_read_alerts(&alerts, 0) != ESP_OK) {
-    return;
-  }
+void CanCommunicator::check_errors() const {
+  twai_status_info_t status;
+  if (twai_get_status_info_v2(twai_handle, &status) != ESP_OK) return;
 
-  if (alerts & TWAI_ALERT_ERR_PASS) {
-    // エラーパッシブ状態（TEC/REC > 127）: BUS_OFF 予兆として記録
-    Serial.println("TWAI: Error Passive state");
-  }
-
-  if (alerts & TWAI_ALERT_BUS_OFF) {
-    bus_off_ = true;
-    Serial.println("TWAI BUS_OFF, リカバリ開始...");
-    // CAN 規定の 128×11 bit リセッシブ列を待つ正規の復帰手順（≒1.4ms）。
-    // uninstall/install は GPIO を再設定してバス上にグリッチを起こすうえ、
-    // 100ms クールダウン中に ACK が返らず他ノードの TEC が蓄積するため使わない。
-    twai_initiate_recovery();
-  }
-
-  if (alerts & TWAI_ALERT_BUS_RECOVERED) {
-    // リカバリ完了後は Stopped 状態になるので twai_start() で再開
-    twai_start();
-    bus_off_ = false;
-    Serial.println("TWAI: リカバリ完了、再開");
+  if (status.state == TWAI_STATE_RUNNING && status.tx_error_counter > 96) {
+    // TEC がエラーパッシブ閾値 (127) に達する前にドライバを再起動して TEC をリセット。
+    // twai_stop → twai_start はハードウェアリセットモードを経由するため TEC が 0 に戻る。
+    // バスオフを未然に防ぐことで ss=1 + ERRATA_FIX_TX_INTR_LOST の assertion バグを回避。
+    twai_stop_v2(twai_handle);
+    twai_start_v2(twai_handle);
+#ifdef CAN_DEBUG
+    Serial.println("CAN: restarted (TEC=" + String(status.tx_error_counter) + ")");
+#endif
+  } else if (status.state == TWAI_STATE_BUS_OFF) {
+    // フォールバック: TWAI_MODE_NO_ACK とプリエンプティブ再起動で通常は到達しないはず
+    twai_initiate_recovery_v2(twai_handle);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    twai_start_v2(twai_handle);
+#ifdef CAN_DEBUG
+    Serial.println("CAN: bus-off recovered");
+#endif
   }
 }
 
-void CanCommunicator::transmit(const CanTxMessage message) {
-  // BUS_OFF 復帰中は送信しない
-  if (bus_off_) {
+void CanCommunicator::transmit(const CanTxMessage message) const {
+  static uint32_t count = 0;
+  count++;
+
+  twai_message_t tx_message;
+  tx_message.identifier = message.id;
+  tx_message.extd = 0;
+  tx_message.rtr = 0;
+  tx_message.ss = 1;
+  tx_message.self = 0;
+  tx_message.dlc_non_comp = 0;
+  tx_message.data_length_code = 8;
+  for (uint8_t i = 0; i < 8; i++) {
+    tx_message.data[i] = message.data[i];
+  }
+
+  const auto tx_result = twai_transmit_v2(twai_handle, &tx_message, 0);
+
+  if (tx_result == ESP_ERR_INVALID_STATE) {
+    check_errors();
     return;
   }
 
-  twai_message_t tx_msg;
-  tx_msg.identifier = message.id;
-  tx_msg.extd = 0;  // 標準フレーム (11-bit ID)
-  tx_msg.rtr = 0;   // データフレーム
-  tx_msg.ss = 1;    // シングルショット（再送しない）
-  tx_msg.self = 0;  // セルフ受信なし
-  tx_msg.data_length_code = 8;
-
-  for (int i = 0; i < 8; i++) {
-    tx_msg.data[i] = message.data[i];
+#ifdef CAN_DEBUG
+  if (count % DEBUG_PRINT_INTERVAL == 0 && tx_result != ESP_OK) {
+    Serial.print("Transmit Fail: ");
+    Serial.println(tx_result);
   }
-
-  twai_transmit(&tx_msg, pdMS_TO_TICKS(5));
+#endif
 }
 
-void CanCommunicator::process_received_messages() {
-  handle_alerts();
+void CanCommunicator::receive() const {
+  static uint32_t count = 0;
+  count++;
 
-  if (bus_off_) {
+  twai_message_t rx_message;
+  const auto rx_result = twai_receive_v2(twai_handle, &rx_message, 0);
+
+  // 150ms ごとに TEC を確認し、バスオフに達する前にプリエンプティブ再起動する
+  if (count % 50 == 0) {
+    check_errors();
+  }
+
+  if (rx_result == ESP_ERR_INVALID_STATE) {
+    check_errors();
     return;
   }
 
-  twai_message_t rx_msg;
+  // ESP_ERR_TIMEOUT はキューが空の正常状態 (timeout=0 のため頻繁に発生)
+  if (rx_result != ESP_OK) {
+    return;
+  }
 
-  while (twai_receive(&rx_msg, 0) == ESP_OK) {
-    if (!rx_msg.rtr) {
-      std::array<uint8_t, 8> data_array;
-      for (int i = 0; i < 8; i++) {
-        data_array[i] = rx_msg.data[i];
-      }
+  if (rx_message.rtr || rx_message.extd) {
+    return;
+  }
 
-      for (const auto& listener_pair : receive_event_listeners) {
-        const auto& target_ids = listener_pair.first;
-        const auto& callback = listener_pair.second;
+  const auto rx_id = rx_message.identifier;
+  std::array<uint8_t, 8> rx_buf = {};
+  for (uint8_t i = 0; i < 8; i++) {
+    rx_buf[i] = rx_message.data[i];
+  }
 
-        // ID リストが空なら全受信、指定があれば一致確認
-        bool match = target_ids.empty();
-        if (!match) {
-          for (const auto& id : target_ids) {
-            if (id == rx_msg.identifier) {
-              match = true;
-              break;
-            }
-          }
-        }
-
-        if (match && callback) {
-          callback(rx_msg.identifier, data_array);
-        }
-      }
+  for (const auto& listener : receive_event_listeners) {
+    if (std::any_of(
+            listener.first.begin(), listener.first.end(),
+            [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
+      listener.second(rx_id, rx_buf);
     }
   }
 }
@@ -133,7 +137,7 @@ void CanCommunicator::add_receive_event_listener(
     std::vector<can::CanId> listening_can_ids,
     std::function<void(const can::CanId, const std::array<uint8_t, 8>)>
         listener) {
-  receive_event_listeners.push_back({listening_can_ids, listener});
+  receive_event_listeners.push_back(
+      std::make_pair(listening_can_ids, listener));
 }
-
 }  // namespace can

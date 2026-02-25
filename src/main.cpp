@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -22,8 +22,8 @@ SemaphoreHandle_t DataMutex = NULL;
 // 開発時に WiFi 接続する用
 #if (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
 char ssid[] = "DRC";
-char psk[] = "28228455";
-IPAddress agent_ip(192, 168, 0, 101);
+char psk[] = "kumachan";
+IPAddress agent_ip(192, 168, 1, 101);
 size_t agent_port = 8888;
 #endif
 
@@ -174,34 +174,33 @@ void compute_motor_commands(WheelRPMs target_rpm, int32_t out_current[4]) {
     float d_error = (error - prev_rpm_errors[i]) / DT;
     prev_rpm_errors[i] = error;
 
-    int32_t command_current = 0;
-    float p_term = 0.0f;
-    float i_term = 0.0f;
-    float d_term = 0.0f;
-
-    // 目標 RPM が 0 のときは積分項をリセットして出力 0
-    if (target_arr[i] == 0) {
-      prev_rpm_errors[i] = 0.0f;
+    // target=0 のとき積分をリセットするが、出力は 0 に固定しない。
+    // P/D 項によるアクティブブレーキを継続することで即時停止させる。
+    if (target_arr[i] == 0.0f) {
       integral_errors[i] = 0.0f;
-    } else {
-      p_term = local_kp * error;
-      i_term = local_ki * integral_errors[i];
-      d_term = local_kd * d_error;
-      float pid_output = p_term + i_term + d_term;
+    }
 
-      command_current = static_cast<int32_t>(pid_output);
-      int32_t unclamped_current = command_current;
+    float p_term = local_kp * error;
+    float i_term = local_ki * integral_errors[i];
+    float d_term = local_kd * d_error;
+    float pid_output = p_term + i_term + d_term;
 
-      if (command_current > CLAMPING_OUTPUT) {
-        command_current = CLAMPING_OUTPUT;
-      } else if (command_current < -CLAMPING_OUTPUT) {
-        command_current = -CLAMPING_OUTPUT;
-      }
+    int32_t command_current = static_cast<int32_t>(pid_output);
+    if (command_current > CLAMPING_OUTPUT) {
+      command_current = CLAMPING_OUTPUT;
+    } else if (command_current < -CLAMPING_OUTPUT) {
+      command_current = -CLAMPING_OUTPUT;
+    }
 
-      // Anti-windup: 出力が飽和していない場合のみ積分を更新
-      if (command_current == unclamped_current) {
+    // 方向性 Anti-windup:
+    // 飽和方向と同じ向きに error がある場合のみ積分を止める。
+    // 逆方向 (脱飽和方向) の error なら積分を続け、素早く飽和を解消させる。
+    if (target_arr[i] != 0.0f) {
+      bool winding_up_pos = (pid_output > CLAMPING_OUTPUT) && (error > 0.0f);
+      bool winding_up_neg = (pid_output < -CLAMPING_OUTPUT) && (error < 0.0f);
+
+      if (!winding_up_pos && !winding_up_neg) {
         integral_errors[i] += error * DT;
-
         if (integral_errors[i] > INTEGRAL_LIMIT) {
           integral_errors[i] = INTEGRAL_LIMIT;
         } else if (integral_errors[i] < -INTEGRAL_LIMIT) {
@@ -377,7 +376,8 @@ void ControlTask(void* pvParameters) {
 
   while (1) {
     // CAN 受信処理（キューを 1 つずつ処理）
-    can_comm->process_received_messages();
+    // can_comm->process_received_messages();
+    can_comm->receive();
 
     // 制御計算
     int32_t output_currents[4] = {0, 0, 0, 0};
@@ -455,6 +455,9 @@ void MicroROSTask(void* pvParameters) {
   set_microros_serial_transports(Serial);
 #elif (MICRO_ROS_TRANSPORT_ARDUINO_WIFI == 1)
   set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
+  // パワーセーブを無効化: DTIM スリープ中のパケット遅延（最大 100ms）が
+  // micro-ROS keepalive の UDP タイムアウトを引き起こすのを防ぐ。
+  esp_wifi_set_ps(WIFI_PS_NONE);
 #endif
 
   AgentState agent_state = AgentState::WAITING;
@@ -481,7 +484,7 @@ void MicroROSTask(void* pvParameters) {
         // 約 1 秒ごとに agent の死活確認
         if (++ping_counter >= 100) {
           ping_counter = 0;
-          if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+          if (rmw_uros_ping_agent(200, 3) != RMW_RET_OK) {
 #if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
             Serial.println("micro-ROS: agent disconnected");
 #endif
