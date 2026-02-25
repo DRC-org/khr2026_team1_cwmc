@@ -13,14 +13,15 @@ CanCommunicator::CanCommunicator() : receive_event_listeners() {}
 
 void CanCommunicator::setup(twai_filter_config_t filter_config) {
   twai_general_config_t general_config =
-      // NO_ACK モード: ACK ビットを要求しないため ACK エラーが発生せず TEC が上昇しない。
-      // これによりモーター側の瞬断でもバスオフを防げる。受信は正常に動作する。
-      TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NO_ACK);
+      TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL);
   general_config.tx_queue_len = 0;
+  // 4モーター × フィードバック頻度 × 制御周期 3ms
+  // 分のバーストを収容できるサイズ
+  general_config.rx_queue_len = 20;
   twai_timing_config_t timing_config = TWAI_TIMING_CONFIG_1MBITS();
 
-  const auto driver_install_result = twai_driver_install_v2(
-      &general_config, &timing_config, &filter_config, &twai_handle);
+  const auto driver_install_result =
+      twai_driver_install(&general_config, &timing_config, &filter_config);
   if (driver_install_result == ESP_OK) {
     Serial.println("Driver install OK!");
   } else {
@@ -28,7 +29,7 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
     return;
   }
 
-  const auto start_result = twai_start_v2(twai_handle);
+  const auto start_result = twai_start();
   if (start_result == ESP_OK) {
     Serial.println("Driver start OK!");
   } else {
@@ -39,26 +40,28 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
 
 void CanCommunicator::check_errors() const {
   twai_status_info_t status;
-  if (twai_get_status_info_v2(twai_handle, &status) != ESP_OK) return;
+  if (twai_get_status_info(&status) != ESP_OK) return;
 
-  if (status.state == TWAI_STATE_RUNNING && status.tx_error_counter > 96) {
-    // TEC がエラーパッシブ閾値 (127) に達する前にドライバを再起動して TEC をリセット。
-    // twai_stop → twai_start はハードウェアリセットモードを経由するため TEC が 0 に戻る。
-    // バスオフを未然に防ぐことで ss=1 + ERRATA_FIX_TX_INTR_LOST の assertion バグを回避。
-    twai_stop_v2(twai_handle);
-    twai_start_v2(twai_handle);
-#ifdef CAN_DEBUG
-    Serial.println("CAN: restarted (TEC=" + String(status.tx_error_counter) + ")");
-#endif
-  } else if (status.state == TWAI_STATE_BUS_OFF) {
-    // フォールバック: TWAI_MODE_NO_ACK とプリエンプティブ再起動で通常は到達しないはず
-    twai_initiate_recovery_v2(twai_handle);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    twai_start_v2(twai_handle);
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    // twai_initiate_recovery() は ss=1 + CONFIG_TWAI_ERRATA_FIX_TX_INTR_LOST と
+    // 組み合わせると assert クラッシュを引き起こす。
+    // twai_stop() は BUS_OFF 状態でも呼び出し可能。
+    // stop → start はハードウェアリセット経由のため TEC と REC が両方 0 にリセットされる。
+    twai_stop();
+    twai_start();
 #ifdef CAN_DEBUG
     Serial.println("CAN: bus-off recovered");
 #endif
+  } else if (status.state == TWAI_STATE_STOPPED) {
+    twai_start();
+#ifdef CAN_DEBUG
+    Serial.println("CAN: restarted from STOPPED");
+#endif
   }
+  // TEC>96 によるプリエンプティブ再起動を廃止。
+  // twai_stop() 呼び出しが C620 フレームの受信を中断し ESP32 の REC を蓄積させ、
+  // エラーパッシブ状態に陥って C620 フィードバックが無音で破棄される根本原因だった。
+  // ss=1 + ERRATA_FIX_TX_INTR_LOST の TX 割り込み消失 (Transmit Fail: -1) も同原因。
 }
 
 void CanCommunicator::transmit(const CanTxMessage message) const {
@@ -77,7 +80,7 @@ void CanCommunicator::transmit(const CanTxMessage message) const {
     tx_message.data[i] = message.data[i];
   }
 
-  const auto tx_result = twai_transmit_v2(twai_handle, &tx_message, 0);
+  const auto tx_result = twai_transmit(&tx_message, 0);
 
   if (tx_result == ESP_ERR_INVALID_STATE) {
     check_errors();
@@ -96,39 +99,43 @@ void CanCommunicator::receive() const {
   static uint32_t count = 0;
   count++;
 
-  twai_message_t rx_message;
-  const auto rx_result = twai_receive_v2(twai_handle, &rx_message, 0);
-
-  // 150ms ごとに TEC を確認し、バスオフに達する前にプリエンプティブ再起動する
-  if (count % 50 == 0) {
+  if (count % 10 == 0) {
     check_errors();
   }
 
-  if (rx_result == ESP_ERR_INVALID_STATE) {
-    check_errors();
-    return;
-  }
+  // キュー内の全メッセージを処理する。
+  // 1 呼び出しで 1 メッセージしか処理しないと、4 モーターからのフィードバックが
+  // キューに溜まりオーバーフローで破棄され、current_rpm が更新されなくなる。
+  while (true) {
+    twai_message_t rx_message;
+    const auto rx_result = twai_receive(&rx_message, 0);
 
-  // ESP_ERR_TIMEOUT はキューが空の正常状態 (timeout=0 のため頻繁に発生)
-  if (rx_result != ESP_OK) {
-    return;
-  }
+    if (rx_result == ESP_ERR_INVALID_STATE) {
+      check_errors();
+      break;
+    }
 
-  if (rx_message.rtr || rx_message.extd) {
-    return;
-  }
+    // ESP_ERR_TIMEOUT はキューが空の正常状態
+    if (rx_result != ESP_OK) {
+      break;
+    }
 
-  const auto rx_id = rx_message.identifier;
-  std::array<uint8_t, 8> rx_buf = {};
-  for (uint8_t i = 0; i < 8; i++) {
-    rx_buf[i] = rx_message.data[i];
-  }
+    if (rx_message.rtr || rx_message.extd) {
+      continue;
+    }
 
-  for (const auto& listener : receive_event_listeners) {
-    if (std::any_of(
-            listener.first.begin(), listener.first.end(),
-            [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
-      listener.second(rx_id, rx_buf);
+    const auto rx_id = rx_message.identifier;
+    std::array<uint8_t, 8> rx_buf = {};
+    for (uint8_t i = 0; i < 8; i++) {
+      rx_buf[i] = rx_message.data[i];
+    }
+
+    for (const auto& listener : receive_event_listeners) {
+      if (std::any_of(
+              listener.first.begin(), listener.first.end(),
+              [&rx_id](const can::CanId& can_id) { return can_id == rx_id; })) {
+        listener.second(rx_id, rx_buf);
+      }
     }
   }
 }

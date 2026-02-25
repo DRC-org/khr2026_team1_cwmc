@@ -61,6 +61,11 @@ struct WheelRPMs {
 volatile WheelRPMs target = {0, 0, 0, 0};
 volatile WheelRPMs current = {0, 0, 0, 0};
 
+// フィードバック受信タイムスタンプ [fl, fr, rl, rr]
+// register_can_event_handlers() 内のリスナから書かれ、ControlTask
+// から読まれる。 uint32_t 書き込みは ESP32 でアトミックなので Mutex 不要。
+volatile uint32_t last_feedback_ms[4] = {0, 0, 0, 0};
+
 // 各モータの電流値
 struct MotorCurrents {
   int32_t fl;
@@ -129,18 +134,23 @@ void register_can_event_handlers() {
         // volatile int16_t への書き込みは ESP32 でアトミック。
         // Mutex を使うと Core 0 の micro-ROS タスクとの競合で
         // フィードバックがドロップされるため、ここでは使わない。
+        const uint32_t now = millis();
         switch (id) {
           case 0x201:
             current.fl = rpm;
+            last_feedback_ms[0] = now;
             break;
           case 0x202:
             current.fr = rpm;
+            last_feedback_ms[1] = now;
             break;
           case 0x203:
             current.rl = rpm;
+            last_feedback_ms[2] = now;
             break;
           case 0x204:
             current.rr = rpm;
+            last_feedback_ms[3] = now;
             break;
         }
       });
@@ -379,6 +389,17 @@ void ControlTask(void* pvParameters) {
     // can_comm->process_received_messages();
     can_comm->receive();
 
+    // フィードバックタイムアウト: C620 が bus-off
+    // 等でフィードバックを停止した場合、 current が古い値のまま残り PID
+    // が暴走するのを防ぐ。
+    // {
+    //   const uint32_t now = millis();
+    //   if (now - last_feedback_ms[0] > 200) current.fl = 0;
+    //   if (now - last_feedback_ms[1] > 200) current.fr = 0;
+    //   if (now - last_feedback_ms[2] > 200) current.rl = 0;
+    //   if (now - last_feedback_ms[3] > 200) current.rr = 0;
+    // }
+
     // 制御計算
     int32_t output_currents[4] = {0, 0, 0, 0};
     WheelRPMs local_current_rpms;
@@ -403,6 +424,31 @@ void ControlTask(void* pvParameters) {
 // Serial transport 使用時は Serial がバイナリプロトコルに占有されるため、
 // デバッグ出力を有効にするとフレームが壊れて切断の原因になる
 #if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
+    // モーターごとのフィードバック途絶を検出し、TWAI 状態を一度だけ出力する
+    {
+      static bool feedback_lost[4] = {false, false, false, false};
+      const uint32_t now = millis();
+      const char* motor_names[4] = {"fl(0x201)", "fr(0x202)", "rl(0x203)", "rr(0x204)"};
+      for (int i = 0; i < 4; i++) {
+        bool is_lost = (now - last_feedback_ms[i] > 1000);
+        if (is_lost && !feedback_lost[i]) {
+          feedback_lost[i] = true;
+          twai_status_info_t st;
+          twai_get_status_info(&st);
+          Serial.print("DIAG: feedback lost ");
+          Serial.print(motor_names[i]);
+          Serial.print(" | state=");
+          Serial.print(st.state);
+          Serial.print(" TEC=");
+          Serial.print(st.tx_error_counter);
+          Serial.print(" REC=");
+          Serial.println(st.rx_error_counter);
+        } else if (!is_lost) {
+          feedback_lost[i] = false;
+        }
+      }
+    }
+
     static int debug_count = 0;
     if (debug_count++ > 300) {
       debug_count = 0;
