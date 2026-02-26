@@ -2,156 +2,132 @@
 
 #include <Arduino.h>
 
-// 【重要】お使いのボードに合わせてピン番号を変更してください
-// 一般的なESP32でのCANピン設定例 (GPIO 5, 4)
-#ifndef CAN_TX
-#define CAN_TX GPIO_NUM_16
-#endif
-#ifndef CAN_RX
-#define CAN_RX GPIO_NUM_4
-#endif
-
 namespace can {
+constexpr gpio_num_t CAN_TX = GPIO_NUM_16;
+constexpr gpio_num_t CAN_RX = GPIO_NUM_4;
 
-CanCommunicator::CanCommunicator() {}
+CanCommunicator::CanCommunicator()
+    : node_hdl(NULL), receive_event_listeners() {}
 
-void CanCommunicator::setup(twai_filter_config_t filter_config) {
-  // 1. 一般設定 (TXピン, RXピン, モード設定)
-  // バスオフ状態からの自動復帰を有効にするため TWAI_ALERT_BUS_RECOVERED
-  // を監視するか、 あるいは単純にドライバの自動復帰機能を信頼して運用します。
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-      (gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
-  g_config.tx_queue_len = 50;
-  g_config.rx_queue_len = 50;
-  // エラー時に自動でバスオフから復帰するように設定（重要）
-  // これを設定しないと、エラーが蓄積してバスオフになった際、手動でリセットしない限り復帰できません
-  // ただし、ESP-IDFのバージョンによっては構造体のメンバ名が異なる場合があるため注意が必要ですが、
-  // Arduino-ESP32 では通常デフォルトで自動復帰は無効です。
-  // ここではドライバ再起動を試みるロジックを別途入れるか、またはアラートを監視するのが定石です。
+// TODO: エラーからの復帰
 
-  // 2. タイミング設定 (1Mbit/s)
-  // 通信相手のビットレートと必ず合わせる必要があります
-  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+void CanCommunicator::setup(twai_mask_filter_config_t filter_config) {
+  twai_onchip_node_config_t node_config = {};
+  node_config.io_cfg.tx = CAN_TX;
+  node_config.io_cfg.rx = CAN_RX;
+  node_config.bit_timing.bitrate = 1000000;  // 1Mbps
+  node_config.tx_queue_depth = 20;
+  node_config.flags.no_receive_rtr = true;
 
-  // 3. フィルタ設定 (引数から受け取る)
-  twai_filter_config_t f_config = filter_config;
-
-  // ドライバのインストール
-  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-    Serial.println("Failed to install TWAI driver");
+  // TWAI コントローラのインスタンスを作成
+  if (twai_new_node_onchip(&node_config, &node_hdl) == ESP_OK) {
+    Serial.println("Node create OK!");
+  } else {
+    Serial.println("Node create fail!");
     return;
   }
-  Serial.println("TWAI Driver installed");
 
-  // ドライバの開始
-  if (twai_start() != ESP_OK) {
-    Serial.println("Failed to start TWAI driver");
+  // receive イベントを登録
+  twai_event_callbacks_t user_cbs = {};
+  user_cbs.on_rx_done = &CanCommunicator::receive;
+
+  if (twai_node_register_event_callbacks(node_hdl, &user_cbs, this) == ESP_OK) {
+    Serial.println("Register receive event OK!");
+  } else {
+    Serial.println("Register receive event fail!");
     return;
   }
-  Serial.println("TWAI Driver started");
+
+  // フィルタ設定（デフォルトは全受信）
+  twai_mask_filter_config_t default_config = {};
+  if (memcmp(&filter_config, &default_config,
+             sizeof(twai_mask_filter_config_t)) != 0) {
+    if (twai_node_config_mask_filter(node_hdl, 0, &filter_config) != ESP_OK) {
+      Serial.println("Failed to set custom filter config");
+    } else {
+      Serial.println("Custom filter config applied");
+    }
+  }
+
+  // TWAI コントローラを有効化
+  if (twai_node_enable(node_hdl) == ESP_OK) {
+    Serial.println("Node enable OK!");
+  } else {
+    Serial.println("Node enable fail!");
+    return;
+  }
 }
 
 void CanCommunicator::transmit(const CanTxMessage message) const {
-  // flags の reserved/dlc_non_comp ビットにゴミが混入しないようゼロ初期化
-  twai_message_t tx_msg = {};
-  tx_msg.identifier = message.id;
-  tx_msg.extd = 0;
-  tx_msg.rtr = 0;
-  tx_msg.ss = 0;
-  tx_msg.self = 0;
-  tx_msg.data_length_code = 8;
+  uint8_t send_buff[8] = {0};
+
+  twai_frame_t tx_msg = {};
+  tx_msg.header.id = message.id;
+  tx_msg.header.ide = false;  // 標準フレーム (11-bit ID)
+  tx_msg.header.fdf = false;  // CAN FD は使わない
+  tx_msg.header.dlc = 8;
 
   for (int i = 0; i < 8; i++) {
-    tx_msg.data[i] = message.data[i];
+    send_buff[i] = message.data[i];
   }
+
+  tx_msg.buffer = send_buff;
+  tx_msg.buffer_len = sizeof(send_buff);
 
   // ControlTask の 3ms 周期を守るためノンブロッキング送信
-  if (twai_transmit(&tx_msg, 0) == ESP_OK) {
+  if (twai_node_transmit(node_hdl, &tx_msg, 0) == ESP_OK) {
     return;
-  }
-
-  twai_status_info_t status_info = {};
-  twai_get_status_info(&status_info);
-  uint32_t alerts = 0;
-  twai_read_alerts(&alerts, 0);
-
-  // ログスパム防止: 1 秒に 1 回まで
-  static uint32_t last_error_ms = 0;
-  const uint32_t now = millis();
-  if (now - last_error_ms >= 1000) {
-    last_error_ms = now;
-    Serial.print("Failed to queue message. State: ");
-    Serial.print(status_info.state);
-    Serial.print(", TED: ");
-    Serial.print(status_info.tx_error_counter);
-    Serial.print(", RED: ");
-    Serial.print(status_info.rx_error_counter);
-    Serial.print(", Alerts: ");
-    Serial.println(alerts, HEX);
-  }
-
-  switch (status_info.state) {
-    case TWAI_STATE_BUS_OFF:
-      twai_initiate_recovery();
-      break;
-    case TWAI_STATE_STOPPED:
-      // 何らかの理由でドライバが停止していた場合に再起動する
-      twai_start();
-      break;
-    case TWAI_STATE_RECOVERING:
-      // 復旧シーケンス中は完了を待つだけ
-      break;
-    default:
-      break;
   }
 }
 
-void CanCommunicator::process_received_messages() {
-  twai_message_t rx_msg;
+bool CanCommunicator::receive(twai_node_handle_t handle,
+                              const twai_rx_done_event_data_t* edata,
+                              void* user_ctx) {
+  auto* communicator = static_cast<CanCommunicator*>(user_ctx);
 
-  // 受信キューにメッセージがあるか確認 (待機時間0でポーリング)
-  while (twai_receive(&rx_msg, 0) == ESP_OK) {
-    // データフレームのみ処理 (RTRフレームは無視)
-    if (!rx_msg.rtr) {
-      // std::array に変換
-      std::array<uint8_t, 8> data_array;
-      for (int i = 0; i < 8; i++) {
-        data_array[i] = rx_msg.data[i];
-      }
+  uint8_t recv_buff[8];
+  twai_frame_t rx_frame = {
+      .buffer = recv_buff,
+      .buffer_len = sizeof(recv_buff),
+  };
 
-      // 【デバッグ用】全受信メッセージをログ出力
-      // Serial.print("CAN RX ID: 0x");
-      // Serial.print(rx_msg.identifier, HEX);
-      // Serial.print(" Data: ");
-      // for(int i=0; i<8; i++) {
-      //     Serial.print(data_array[i], HEX);
-      //     Serial.print(" ");
-      // }
-      // Serial.println();
+  const auto rx_result =
+      twai_node_receive_from_isr(communicator->node_hdl, &rx_frame);
+  if (rx_result != ESP_OK) {
+#ifdef CAN_DEBUG
+    Serial.println("Receive fail: twai_node_receive_from_isr error");
+#endif
+    return false;
+  }
 
-      // 登録されたリスナーに通知
-      for (const auto& listener_pair : receive_event_listeners) {
-        const auto& target_ids = listener_pair.first;
-        const auto& callback = listener_pair.second;
+  std::array<uint8_t, 8> data_array;
+  for (uint8_t i = 0; i < rx_frame.header.dlc; i++) {
+    data_array[i] = rx_frame.buffer[i];
+  }
 
-        // ターゲットIDリストが空なら「すべて受信」、指定があれば一致確認
-        bool match = target_ids.empty();
-        if (!match) {
-          for (const auto& id : target_ids) {
-            if (id == rx_msg.identifier) {
-              match = true;
-              break;
-            }
-          }
-        }
+  // 登録されたリスナーに通知
+  for (const auto& listener_pair : communicator->receive_event_listeners) {
+    const auto& target_ids = listener_pair.first;
+    const auto& callback = listener_pair.second;
 
-        // マッチしたらコールバック実行
-        if (match && callback) {
-          callback(rx_msg.identifier, data_array);
+    // ターゲットIDリストが空なら「すべて受信」、指定があれば一致確認
+    bool match = target_ids.empty();
+    if (!match) {
+      for (const auto& id : target_ids) {
+        if (id == rx_frame.header.id) {
+          match = true;
+          break;
         }
       }
     }
+
+    // マッチしたらコールバック実行
+    if (match && callback) {
+      callback(rx_frame.header.id, data_array);
+    }
   }
+
+  return true;
 }
 
 void CanCommunicator::add_receive_event_listener(

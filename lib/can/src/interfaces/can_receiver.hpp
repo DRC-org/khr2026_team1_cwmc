@@ -11,9 +11,6 @@ class CanReceiver {
  public:
   virtual ~CanReceiver() = default;
 
-  /// @brief 受信キューに入っているメッセージを処理します。
-  virtual void process_received_messages() = 0;
-
   /// @brief CAN受信時のイベントハンドラを追加します。
   /// @param listening_can_ids イベントハンドラを発火させるCAN IDのリスト
   /// @param listener 登録するイベントハンドラ
