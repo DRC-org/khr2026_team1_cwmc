@@ -8,12 +8,14 @@
 #include <rclc/executor.h>
 #include <rclc/rclc.h>
 #include <robot_msgs/msg/detail/feedback_pid_terms__functions.h>
+#include <robot_msgs/msg/detail/imu_values__functions.h>
 #include <robot_msgs/msg/detail/pid_gains__functions.h>
 #include <robot_msgs/msg/wheel_message.h>
 #include <stdlib.h>
 
 #include <can/core.hpp>
 #include <can/peripheral.hpp>
+#include <lsm9ds1_control/core.cpp>
 
 TaskHandle_t MicroROSTaskHandle = NULL;
 TaskHandle_t ControlTaskHandle = NULL;
@@ -36,6 +38,7 @@ size_t agent_port = 8888;
   }
 
 can::CanCommunicator* can_comm;
+lsm9ds1_control::Lsm9ds1Controller lsm_controller;
 
 // micro-ROS オブジェクト
 rcl_publisher_t pub_feedback;
@@ -299,6 +302,21 @@ IRAM_ATTR void timer_feedback_callback(rcl_timer_t* timer,
     xSemaphoreGive(DataMutex);
   }
 
+  lsm9ds1_control::ImuValues imu = lsm_controller.get_all_values();
+  feedback_msg.lsm9ds1_values.data[0].ax = imu.ax;
+  feedback_msg.lsm9ds1_values.data[0].ay = imu.ay;
+  feedback_msg.lsm9ds1_values.data[0].az = imu.az;
+  feedback_msg.lsm9ds1_values.data[0].gx = imu.gx;
+  feedback_msg.lsm9ds1_values.data[0].gy = imu.gy;
+  feedback_msg.lsm9ds1_values.data[0].gz = imu.gz;
+  feedback_msg.lsm9ds1_values.data[0].mx = imu.mx;
+  feedback_msg.lsm9ds1_values.data[0].my = imu.my;
+  feedback_msg.lsm9ds1_values.data[0].mz = imu.mz;
+  feedback_msg.lsm9ds1_values.data[0].roll = imu.roll;
+  feedback_msg.lsm9ds1_values.data[0].pitch = imu.pitch;
+  feedback_msg.lsm9ds1_values.data[0].yaw = imu.yaw;
+  feedback_msg.lsm9ds1_values.size = 1;
+
   feedback_msg.m3508_gains.size = 1;
   feedback_msg.m3508_terms.size = 1;
 
@@ -333,6 +351,7 @@ static bool create_entities() {
 
   // __init は Sequence の data を NULL・容量 0 で初期化するため、
   // data[0] アクセス前に容量 1 で明示的にアロケートする
+  robot_msgs__msg__IMUValues__Sequence__init(&feedback_msg.lsm9ds1_values, 1);
   robot_msgs__msg__PIDGains__Sequence__init(&control_msg.m3508_gains, 1);
   robot_msgs__msg__PIDGains__Sequence__init(&feedback_msg.m3508_gains, 1);
   robot_msgs__msg__FeedbackPIDTerms__Sequence__init(&control_msg.m3508_terms,
@@ -515,6 +534,8 @@ void setup() {
 #endif
 
   DataMutex = xSemaphoreCreateMutex();
+
+  lsm_controller.setup();
 
   // CAN 通信の初期化（フィルタなし = 全受信）
   can_comm = new can::CanCommunicator();
