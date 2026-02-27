@@ -20,7 +20,8 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
 
   /// @brief セットアップ処理
   /// @param filter_config フィルタ設定（デフォルトは全受信）
-  void setup(twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
+  void setup(
+      twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
 
   /// @brief メッセージ送信
   void transmit(const CanTxMessage message) const override;
