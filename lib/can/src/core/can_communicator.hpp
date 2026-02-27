@@ -1,13 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
-#include <esp_twai.h>
-#include <esp_twai_onchip.h>
-#include <freertos/queue.h>
+#include <driver/twai.h>
 
 #include <array>
 #include <functional>
-#include <string>
 #include <vector>
 
 #include "../interfaces/can_receiver.hpp"
@@ -23,10 +20,13 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
 
   /// @brief セットアップ処理
   /// @param filter_config フィルタ設定（デフォルトは全受信）
-  void setup(twai_mask_filter_config_t filter_config = {});
+  void setup(twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL());
 
   /// @brief メッセージ送信
   void transmit(const CanTxMessage message) const override;
+
+  /// @brief RX キューを処理してリスナーを呼び出す。3ms ごとに呼ぶ。
+  void receive() override;
 
   /// @brief イベントリスナ登録
   void add_receive_event_listener(
@@ -35,12 +35,6 @@ class CanCommunicator : public CanTransmitter, public CanReceiver {
           listener) override;
 
  private:
-  /// @brief CAN 通信のインスタンス
-  twai_node_handle_t node_hdl;
-
-  static bool receive(twai_node_handle_t handle,
-                      const twai_rx_done_event_data_t* edata, void* user_ctx);
-
   /// @brief CAN受信時のイベントリスナのリスト
   std::vector<std::pair<
       std::vector<can::CanId>,

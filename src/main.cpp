@@ -394,6 +394,9 @@ void ControlTask(void* pvParameters) {
   xLastWakeTime = xTaskGetTickCount();
 
   while (1) {
+    // M3508 RPM フィードバックを RX キューから取得
+    can_comm->receive();
+
     // 制御計算
     int32_t output_currents[4] = {0, 0, 0, 0};
     WheelRPMs local_current_rpms;

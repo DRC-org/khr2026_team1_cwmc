@@ -11,6 +11,9 @@ class CanReceiver {
  public:
   virtual ~CanReceiver() = default;
 
+  /// @brief RX キューを処理してリスナーを呼び出します。3ms ごとに呼ぶ。
+  virtual void receive() = 0;
+
   /// @brief CAN受信時のイベントハンドラを追加します。
   /// @param listening_can_ids イベントハンドラを発火させるCAN IDのリスト
   /// @param listener 登録するイベントハンドラ
