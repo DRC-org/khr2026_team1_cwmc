@@ -10,9 +10,12 @@ namespace lsm9ds1_control {
 Lsm9ds1Controller::Lsm9ds1Controller() : yaw_offset_(0.0f) {}
 
 void Lsm9ds1Controller::setup() {
-  Wire.begin();
-  Wire.setClock(400000);
-  imu.begin();
+  // Wire.begin() に周波数を渡す（setClock() を後から呼ぶと esp32-hal-i2c-ng
+  // でバス状態が壊れる）
+  Wire.begin(-1, -1, 400000);
+  // Akizuki AE-LSM9DS1 は SA0=0 のため AG=0x6A, M=0x1C（SparkFun
+  // ライブラリデフォルトの 0x6B/0x1E とは異なる）
+  imu.begin(LSM9DS1_AG_ADDR(0), LSM9DS1_M_ADDR(0));
 }
 
 float Lsm9ds1Controller::get_yaw() {
@@ -32,9 +35,7 @@ float Lsm9ds1Controller::get_yaw() {
 void Lsm9ds1Controller::reset_yaw() { yaw_offset_ = get_raw_yaw(); }
 
 float Lsm9ds1Controller::get_raw_yaw() {
-  if (imu.magAvailable()) {
-    imu.readMag();
-  }
+  imu.readMag();
 
   float mx = -imu.my;
   float my = -imu.mx;
@@ -60,9 +61,11 @@ float Lsm9ds1Controller::get_raw_yaw() {
 }
 
 ImuValues Lsm9ds1Controller::get_all_values() {
-  if (imu.accelAvailable()) imu.readAccel();
-  if (imu.gyroAvailable()) imu.readGyro();
-  if (imu.magAvailable()) imu.readMag();
+  // Available() チェックは no-STOP I2C パターンを使い esp32-hal-i2c-ng
+  // と相性が悪いため廃止。 50ms 間隔での呼び出しでは常に新データが存在する。
+  imu.readAccel();
+  imu.readGyro();
+  imu.readMag();
 
   ImuValues v;
 
@@ -94,13 +97,17 @@ ImuValues Lsm9ds1Controller::get_all_values() {
     yaw = atan2f(mx, my);
   }
   yaw -= MAG_DECLINATION * DEG_TO_RAD;
-  if (yaw > PI) yaw -= 2.0f * PI;
-  else if (yaw < -PI) yaw += 2.0f * PI;
+  if (yaw > PI)
+    yaw -= 2.0f * PI;
+  else if (yaw < -PI)
+    yaw += 2.0f * PI;
   yaw *= RAD_TO_DEG;
 
   float adjusted_yaw = yaw - yaw_offset_;
-  if (adjusted_yaw > 180.0f) adjusted_yaw -= 360.0f;
-  else if (adjusted_yaw < -180.0f) adjusted_yaw += 360.0f;
+  if (adjusted_yaw > 180.0f)
+    adjusted_yaw -= 360.0f;
+  else if (adjusted_yaw < -180.0f)
+    adjusted_yaw += 360.0f;
   v.yaw = adjusted_yaw;
 
   return v;
