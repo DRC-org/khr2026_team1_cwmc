@@ -18,16 +18,24 @@ void CanCommunicator::setup(twai_filter_config_t filter_config) {
   twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
 
   if (twai_driver_install(&g_config, &t_config, &filter_config) == ESP_OK) {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     Serial.println("Driver install OK!");
+#endif
   } else {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     Serial.println("Driver install fail!");
+#endif
     return;
   }
 
   if (twai_start() == ESP_OK) {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     Serial.println("Node enable OK!");
+#endif
   } else {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     Serial.println("Node enable fail!");
+#endif
     return;
   }
 }

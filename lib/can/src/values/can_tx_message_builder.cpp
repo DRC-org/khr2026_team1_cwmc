@@ -44,7 +44,9 @@ CanTxMessageBuilder& CanTxMessageBuilder::set_value(const float value,
   constexpr int32_t min_int32 = -2147483648;
 
   if (value < min_value || value > max_value) {
+#if (MICRO_ROS_TRANSPORT_ARDUINO_SERIAL != 1)
     Serial.println("CanTxMessageBuilder::set_value: value is out of range");
+#endif
     return *this;
   }
 
