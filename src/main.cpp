@@ -81,7 +81,7 @@ struct PIDGains {
   float kd;
 };
 
-volatile PIDGains pid_gains = {0.5f, 0.05f, 0.0f};
+volatile PIDGains pid_gains = {10.0f, 0.01f, 0.0f};
 
 // PID Term
 struct PIDTerms {
