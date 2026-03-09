@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -480,6 +481,7 @@ void MicroROSTask(void* pvParameters) {
 
   AgentState agent_state = AgentState::WAITING;
   uint32_t ping_counter = 0;
+  uint32_t waiting_ticks = 0;
 
   while (1) {
     switch (agent_state) {
@@ -490,9 +492,15 @@ void MicroROSTask(void* pvParameters) {
             Serial.println("micro-ROS: connected");
 #endif
             ping_counter = 0;
+            waiting_ticks = 0;
             agent_state = AgentState::CONNECTED;
           } else {
             destroy_entities();
+          }
+        } else {
+          // 30 秒間再接続できなければ transport 層 stale 等からの回復のためリセット
+          if (++waiting_ticks >= 60) {
+            esp_restart();
           }
         }
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -523,6 +531,7 @@ void MicroROSTask(void* pvParameters) {
           target.rr = 0;
           xSemaphoreGive(DataMutex);
         }
+        waiting_ticks = 0;
         destroy_entities();
         agent_state = AgentState::WAITING;
         break;
