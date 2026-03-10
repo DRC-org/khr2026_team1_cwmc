@@ -12,6 +12,7 @@
 #include <robot_msgs/msg/detail/imu_values__functions.h>
 #include <robot_msgs/msg/detail/pid_gains__functions.h>
 #include <robot_msgs/msg/wheel_message.h>
+#include <std_msgs/msg/bool.h>
 #include <stdlib.h>
 
 #include <can/core.hpp>
@@ -99,6 +100,15 @@ struct FeedbackPIDTerms {
 };
 
 volatile FeedbackPIDTerms pid_terms;
+
+// 動的ヘルスチェック
+rcl_subscription_t sub_health_check;
+std_msgs__msg__Bool hc_control_msg;
+bool hc_active   = false;
+int  hc_phase    = 0;
+uint32_t hc_start_ms = 0;
+#define HC_RPM        400.0f
+#define HC_DURATION_MS 500
 
 // volatile int16_t current_rpm_fl = 0;
 // volatile int16_t current_rpm_fr = 0;
@@ -272,6 +282,21 @@ IRAM_ATTR void on_control_command(const void* msg_in) {
   }
 }
 
+// health_check topic の callback
+IRAM_ATTR void on_health_check_command(const void* msg_in) {
+  const auto* cmd = static_cast<const std_msgs__msg__Bool*>(msg_in);
+  if (cmd->data) {
+    if (xSemaphoreTake(DataMutex, portMAX_DELAY) == pdTRUE) {
+      if (!hc_active) {
+        hc_active    = true;
+        hc_phase     = 1;
+        hc_start_ms  = (uint32_t)millis();
+      }
+      xSemaphoreGive(DataMutex);
+    }
+  }
+}
+
 // 50 ms ごとにフィードバックを送信する
 IRAM_ATTR void timer_feedback_callback(rcl_timer_t* timer,
                                        int64_t /*last_call_time*/) {
@@ -343,12 +368,19 @@ static bool create_entities() {
           "wheel_control") != RCL_RET_OK)
     return false;
 
+  if (rclc_subscription_init_default(
+          &sub_health_check, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+          "health_check") != RCL_RET_OK)
+    return false;
+
   if (rclc_timer_init_default(&timer_feedback, &support, RCL_MS_TO_NS(50),
                               timer_feedback_callback) != RCL_RET_OK)
     return false;
 
   robot_msgs__msg__WheelMessage__init(&control_msg);
   robot_msgs__msg__WheelMessage__init(&feedback_msg);
+  std_msgs__msg__Bool__init(&hc_control_msg);
 
   // __init は Sequence の data を NULL・容量 0 で初期化するため、
   // data[0] アクセス前に容量 1 で明示的にアロケートする
@@ -360,7 +392,7 @@ static bool create_entities() {
   robot_msgs__msg__FeedbackPIDTerms__Sequence__init(&feedback_msg.m3508_terms,
                                                     1);
 
-  if (rclc_executor_init(&executor, &support.context, 2, &allocator) !=
+  if (rclc_executor_init(&executor, &support.context, 3, &allocator) !=
       RCL_RET_OK)
     return false;
   if (rclc_executor_add_subscription(&executor, &sub_control, &control_msg,
@@ -368,6 +400,10 @@ static bool create_entities() {
                                      ON_NEW_DATA) != RCL_RET_OK)
     return false;
   if (rclc_executor_add_timer(&executor, &timer_feedback) != RCL_RET_OK)
+    return false;
+  if (rclc_executor_add_subscription(&executor, &sub_health_check,
+                                     &hc_control_msg, &on_health_check_command,
+                                     ON_NEW_DATA) != RCL_RET_OK)
     return false;
 
   return true;
@@ -380,12 +416,14 @@ static void destroy_entities() {
   rclc_executor_fini(&executor);
   rcl_timer_fini(&timer_feedback);
   rcl_subscription_fini(&sub_control, &node);
+  rcl_subscription_fini(&sub_health_check, &node);
   rcl_publisher_fini(&pub_feedback, &node);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
 
   robot_msgs__msg__WheelMessage__fini(&control_msg);
   robot_msgs__msg__WheelMessage__fini(&feedback_msg);
+  std_msgs__msg__Bool__fini(&hc_control_msg);
 }
 
 // Control Task: Core 1, 最高優先度
@@ -408,6 +446,29 @@ void ControlTask(void* pvParameters) {
       local_current_rpms.fr = current.fr;
       local_current_rpms.rl = current.rl;
       local_current_rpms.rr = current.rr;
+
+      // ヘルスチェック中は target を上書きして前進→後退シーケンスを実行
+      if (hc_active) {
+        uint32_t elapsed = (uint32_t)millis() - hc_start_ms;
+        if (hc_phase == 1) {
+          if (elapsed < HC_DURATION_MS) {
+            target.fl =  HC_RPM; target.fr = -HC_RPM;
+            target.rl =  HC_RPM; target.rr = -HC_RPM;
+          } else {
+            hc_phase = 2; hc_start_ms = (uint32_t)millis();
+            target.fl = -HC_RPM; target.fr =  HC_RPM;
+            target.rl = -HC_RPM; target.rr =  HC_RPM;
+          }
+        } else if (hc_phase == 2) {
+          if (elapsed < HC_DURATION_MS) {
+            target.fl = -HC_RPM; target.fr =  HC_RPM;
+            target.rl = -HC_RPM; target.rr =  HC_RPM;
+          } else {
+            target.fl = target.fr = target.rl = target.rr = 0.0f;
+            hc_active = false; hc_phase = 0;
+          }
+        }
+      }
 
       local_target_rpms.fl = target.fl;
       local_target_rpms.fr = target.fr;
