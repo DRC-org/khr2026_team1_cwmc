@@ -16,7 +16,7 @@
 
 #include <can/core.hpp>
 #include <can/peripheral.hpp>
-#include <lsm9ds1_control/core.cpp>
+#include <mpu6050_control/core.cpp>
 
 TaskHandle_t MicroROSTaskHandle = NULL;
 TaskHandle_t ControlTaskHandle = NULL;
@@ -39,7 +39,7 @@ size_t agent_port = 8888;
   }
 
 can::CanCommunicator* can_comm;
-lsm9ds1_control::Lsm9ds1Controller lsm_controller;
+mpu6050_control::Mpu6050Controller imu_controller;
 
 // micro-ROS オブジェクト
 rcl_publisher_t pub_feedback;
@@ -303,7 +303,7 @@ IRAM_ATTR void timer_feedback_callback(rcl_timer_t* timer,
     xSemaphoreGive(DataMutex);
   }
 
-  lsm9ds1_control::ImuValues imu = lsm_controller.get_all_values();
+  mpu6050_control::ImuValues imu = imu_controller.get_all_values();
   feedback_msg.lsm9ds1_values.data[0].ax = imu.ax;
   feedback_msg.lsm9ds1_values.data[0].ay = imu.ay;
   feedback_msg.lsm9ds1_values.data[0].az = imu.az;
@@ -547,7 +547,7 @@ void setup() {
 
   DataMutex = xSemaphoreCreateMutex();
 
-  lsm_controller.setup();
+  imu_controller.setup();
 
   // CAN 通信の初期化（フィルタなし = 全受信）
   can_comm = new can::CanCommunicator();
