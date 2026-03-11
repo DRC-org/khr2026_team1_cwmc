@@ -78,6 +78,8 @@ CanTransmitter (interface)   CanReceiver (interface)
 
 ### CanDest: CAN ID マッピング
 
+cwmc は CAN 2（足回り専用）系統のみ使用。CAN 1（機構系）は hwmc が管理する。
+
 ```cpp
 // lib/can/src/values/can_dest.hpp
 enum class CanDest : can::CanId {
@@ -88,6 +90,8 @@ enum class CanDest : can::CanId {
     power_0   = 0x400, power_1 = 0x401,
 };
 ```
+
+> **注意**: この enum は旧仕様の名残を含む。実際に cwmc が使用するのは `m3508_1`〜`m3508_4`（CAN ID `0x200` で一括送信）のみ。機構系の CAN ID（`0x300` 台、`0x400` 台）は hwmc 側の `CanDest` を参照のこと。
 
 ### CanTxMessageBuilder: 送信メッセージ構築
 
